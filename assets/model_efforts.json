@@ -1,0 +1,95 @@
+{
+  "verified_at": "2026-09-09",
+  "maintenance": "人工核对后更新本文件并重新构建。运行期间只读内嵌表，不联网、不通过刷新模型按钮更新强度。levels 记录当前 CLI 能使用的有效离散强度；思考开关、同义映射不伪装成额外强度。未知模型及 CLI 默认仅提供默认强度。",
+  "sources": {
+    "codex_cli": "2026-09-09 本机已配置 Codex CLI app-server model/list 的 supportedReasoningEfforts 快照；非每次运行时查询",
+    "codex_protocol": "https://learn.chatgpt.com/docs/app-server#list-models-modellist",
+    "luna": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+    "claude": "https://platform.claude.com/docs/en/build-with-claude/effort",
+    "glm": "https://docs.z.ai/guides/capabilities/thinking",
+    "deepseek": "https://api-docs.deepseek.com/guides/thinking_mode/",
+    "kimi_k3": "https://platform.kimi.ai/docs/guide/use-reasoning-effort",
+    "kimi_k2": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
+    "kimi_k27": "https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart"
+  },
+  "entries": [
+    {
+      "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"],
+      "levels": ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "sources": ["codex_cli", "codex_protocol"],
+      "note": "按本机 Codex CLI 能力快照维护，最高 ultra。"
+    },
+    {
+      "models": ["gpt-5.6-luna"],
+      "levels": ["low", "medium", "high", "xhigh", "max"],
+      "sources": ["codex_cli", "luna"],
+      "note": "Luna 最高 max。API 文档另有 none，本机 CLI 模型菜单未列出，因此不作为 CLI 强度选项。"
+    },
+    {
+      "models": ["gpt-5.5", "gpt-5.2"],
+      "levels": ["low", "medium", "high", "xhigh"],
+      "sources": ["codex_cli", "codex_protocol"],
+      "note": "按本机 Codex CLI 能力快照维护，最高 xhigh。"
+    },
+    {
+      "models": ["claude-fable-5-1", "claude-fable-5", "claude-mythos-5-1", "claude-mythos-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5"],
+      "levels": ["low", "medium", "high", "xhigh", "max"],
+      "sources": ["claude"],
+      "note": "这些 Claude 版本支持五档强度，默认 high。"
+    },
+    {
+      "models": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-mythos-preview"],
+      "levels": ["low", "medium", "high", "max"],
+      "sources": ["claude"],
+      "note": "支持 max，但不支持 xhigh；默认 high。"
+    },
+    {
+      "models": ["claude-opus-4-5"],
+      "levels": ["low", "medium", "high"],
+      "sources": ["claude"],
+      "note": "Opus 4.5 支持三档，最高 high。"
+    },
+    {
+      "models": ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-1", "claude-opus-4", "claude-sonnet-4"],
+      "levels": [],
+      "sources": ["claude"],
+      "note": "未支持独立 effort 档位；保留默认，思考预算不是此处的离散强度。"
+    },
+    {
+      "models": ["glm-5.3", "glm-5.3-flash"],
+      "levels": ["low", "high", "max"],
+      "sources": ["glm"],
+      "note": "始终思考，三档有效强度，默认 max；不展示服务端兼容映射的同义档位。"
+    },
+    {
+      "models": ["glm-5.2"],
+      "levels": ["high", "max"],
+      "sources": ["glm"],
+      "note": "有效思考强度为 high/max；low、medium 映射 high，xhigh 映射 max；none/minimal 属于关闭思考，不列为强度。"
+    },
+    {
+      "models": ["glm-5.1", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4.6", "glm-4.5", "glm-4.5-air"],
+      "levels": [],
+      "sources": ["glm"],
+      "note": "独立 reasoning_effort 从 GLM-5.2 开始支持；这些版本仅保留默认。"
+    },
+    {
+      "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+      "levels": ["low", "high", "max"],
+      "sources": ["deepseek"],
+      "note": "三档有效强度，默认 high；medium/xhigh 会被映射为 high，不重复展示。"
+    },
+    {
+      "models": ["kimi-k3"],
+      "levels": ["low", "high", "max"],
+      "sources": ["kimi_k3"],
+      "note": "Kimi K3 支持 low/high/max，默认 max。"
+    },
+    {
+      "models": ["kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2-thinking", "kimi-k2-thinking-turbo"],
+      "levels": [],
+      "sources": ["kimi_k2", "kimi_k27", "kimi_k3"],
+      "note": "K2 系列资料未声明独立 effort 档位，保留默认；思考模式不等同于强度档位。"
+    }
+  ]
+}

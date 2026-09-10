@@ -1,0 +1,4 @@
+{
+  "claude": { "program": "C:/path/to/claude.exe", "model": "GLM-5.2", "effort": null },
+  "codex": { "program": "C:/path/to/codex.exe", "model": null, "effort": null }
+}

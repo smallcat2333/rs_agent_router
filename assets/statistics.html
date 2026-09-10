@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Agent Router · 会话统计</title>
+  <link rel="icon" href="./icon.png">
+  <link rel="stylesheet" href="./statistics.css">
+  <script src="./statistics.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="brand"><img src="./icon.png" width="42" height="42" alt=""><div><div class="eyebrow">AGENT ROUTER / INSIGHTS</div><h1>会话统计</h1><p>执行成本、交付质量与返工，放在同一张工作台上。</p></div></div>
+    <div class="actions"><span id="connection" class="connection">连接中</span><label class="check"><input id="auto-refresh" type="checkbox" checked> 自动刷新</label><button id="refresh">刷新</button><button id="rubric">评分口径</button></div>
+  </header>
+  <section class="filters" aria-label="筛选会话">
+    <label class="search">搜索<input id="search" type="search" placeholder="任务名称、ID 或分组"></label>
+    <label>创建日期，从<input id="date-from" type="date"></label><label>至<input id="date-to" type="date"></label>
+    <label>CLI<select id="cli-filter"><option value="">全部</option></select></label>
+    <label>配置模型<select id="model-filter"><option value="">全部</option></select></label>
+    <label>来源<select id="source-filter"><option value="">全部</option></select></label>
+    <label>APP<select id="app-filter"><option value="">全部</option></select></label>
+    <label>Feat<select id="feat-filter"><option value="">全部</option></select></label>
+    <label>执行状态<select id="state-filter"><option value="">全部</option><option value="running">运行中</option><option value="succeeded">CLI 已完成</option><option value="failed">失败</option><option value="timed_out">超时</option><option value="cancelled">已取消</option><option value="interrupted">中断</option></select></label>
+    <label>审计状态<select id="review-filter"><option value="">全部</option><option value="unreviewed">待评分</option><option value="accepted">审计通过</option><option value="rework">需要返工</option></select></label>
+    <label class="check deleted-check"><input id="include-deleted" type="checkbox"> 含已删除</label><button id="reset" class="quiet">重置</button>
+  </section>
+  <p id="filter-error" class="error" role="alert" hidden></p>
+  <p id="error" class="error" role="alert" hidden></p>
+  <section id="kpis" class="kpis" aria-label="统计摘要"></section>
+  <section class="charts" aria-label="统计图表">
+    <article class="card"><div class="section-title"><h2>评分分布</h2><span id="score-count">仅统计当前已评分会话</span></div><div id="score-chart" class="score-chart"></div></article>
+    <article class="card"><div class="section-title"><h2>每日已知 Token</h2><span>按会话创建日期</span></div><div id="daily-chart" class="daily-chart"></div></article>
+    <article class="card"><div class="section-title"><h2>配置模型用量</h2><span>前 8 项 · 已知 Token</span></div><div id="model-chart" class="model-chart"></div></article>
+  </section>
+  <section class="card sessions">
+    <div class="section-title"><div><h2>会话明细 <span id="row-count" class="counter">0</span></h2><p>默认包含归档。点击会话查看各轮记录与评分依据。</p></div><span id="updated">等待数据</span></div>
+    <div class="table-scroll"><table><thead><tr>
+      <th><button data-sort="created_at_ms">会话 / 分组</button></th><th><button data-sort="model">CLI / 配置模型</button></th><th><button data-sort="state">状态</button></th><th class="numeric"><button data-sort="elapsed_ms">执行耗时</button></th><th class="numeric"><button data-sort="first_text_ms">首字 / 首段</button></th><th class="numeric"><button data-sort="reply_mean_ms">近 5 次均耗时</button></th><th class="numeric"><button data-sort="tokens">Token</button></th><th class="numeric"><button data-sort="score">当前评分</button></th><th class="numeric"><button data-sort="rework_count">返工次数</button></th>
+    </tr></thead><tbody id="rows"></tbody></table></div>
+    <div class="pager"><span id="page-info">—</span><div><button id="previous">上一页</button><button id="next">下一页</button></div></div>
+  </section>
+  <footer>质量分由 Harness 审计后提交；CLI 成功不等于业务验收通过。耗时不含轮次间等待，Token 不重复加计缓存。缺失数据保留为“—”，已知部分单独标记。</footer>
+</main>
+<dialog id="detail"><div class="dialog-header"><div><div class="eyebrow">SESSION REVIEW</div><h2 id="detail-title"></h2></div><button id="close-detail" aria-label="关闭详情">关闭 · Esc</button></div><div id="detail-body"></div></dialog>
+</body>
+</html>

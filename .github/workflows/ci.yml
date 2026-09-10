@@ -1,0 +1,29 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal
+      - name: Test
+        run: cargo +stable test --locked
+      - name: Build release
+        run: cargo +stable build --release --locked
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: rs_agent_router-windows-x64
+          path: target/release/rs_agent_router.exe
+          if-no-files-found: error
+          retention-days: 7

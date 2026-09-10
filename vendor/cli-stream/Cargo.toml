@@ -1,0 +1,60 @@
+[package]
+name = "cli-stream"
+# Versioned independently of agent-harness (not the workspace lockstep): this
+# foundational engine is stable + upstream, so it bumps only when it changes.
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Generic streaming subprocess engine: spawn a CLI, stream its stdout/stderr lines as they arrive, write to its stdin, and cancel it (SIGTERM→SIGKILL) or time it out."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/getlatentic/agent-harness"
+keywords = ["subprocess", "process", "stream", "spawn", "cli"]
+categories = ["command-line-utilities", "os"]
+
+# Pure, standalone leaf utility — generic process streaming with no agent or
+# domain knowledge, usable on its own by anything that drives a child CLI.
+[lib]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Typed errors (StreamError) with a real `std::io::Error` source — derive
+# Display + the Error source chain without hand-writing the impls. Build-time
+# proc-macro only; no runtime weight added to the leaf.
+thiserror = "2"
+
+# Tagged with its own prefix: agent-harness owns the bare `v{version}` scheme,
+# and these crates version independently, so a shared scheme collides the first
+# time cli-stream reaches a version agent-harness already released.
+[package.metadata.release]
+tag-name = "cli-stream-v{{version}}"
+# Its own README pins its own version, and cli-stream versions independently of
+# the workspace — so the replacement belongs here rather than in release.toml,
+# where `{{version}}` would be agent-harness's.
+pre-release-replacements = [
+  { file = "README.md", search = 'cli-stream = "[0-9]+\.[0-9]+(\.[0-9]+)?"', replace = 'cli-stream = "{{version}}"', min = 0 },
+]
+
+[dev-dependencies]
+proptest = "1"
+
+# `ProcessHandle::cancel()` sends SIGTERM on unix (SIGKILL fallback);
+# Windows uses `Child::kill()` (TerminateProcess).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Job Objects, so cancelling ends a process *tree* rather than one process.
+# Windows has no signals and no process groups to kill; a job is the only
+# handle the OS gives you on "this program and everything it started".
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  # `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` — the limits struct carrying
+  # KILL_ON_JOB_CLOSE — lives behind this one.
+  "Win32_System_Threading",
+  # `CreateJobObjectW` takes a `SECURITY_ATTRIBUTES`, so the whole function is
+  # behind this feature — without it the import fails to resolve rather than
+  # failing to link, which is easy to misread as the symbol not existing.
+  "Win32_Security",
+] }

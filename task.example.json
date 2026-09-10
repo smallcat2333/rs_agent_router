@@ -1,0 +1,7 @@
+{
+  "task_id": "T001",
+  "title": "读取输入并核对结果",
+  "group_path": ["Codex桌面端", "rs_agent_router", "未关联Feat"],
+  "workdir": "C:/path/to/workspace",
+  "prompt": "Read input.json and calculate its sum. Do not edit files or commit. Return the result."
+}
