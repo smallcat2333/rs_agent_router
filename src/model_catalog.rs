@@ -7,6 +7,9 @@ use std::{fs, path::Path};
 
 /// Codex 查询所选 CLI 的模型目录；Claude 读取当前供应商映射，无声明时读取生效配置。
 pub fn discover(backend: Backend, program: &Path) -> Result<Vec<String>> {
+    if backend == Backend::Opencode {
+        return Ok(crate::opencode::catalog(program)?.models);
+    }
     if backend == Backend::Codex {
         return codex_models(program);
     }

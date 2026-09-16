@@ -396,7 +396,7 @@ pub fn client_output(value: &Value, waiting: bool, verbose: bool) -> Option<Valu
             } else {
                 &value["state"]
             };
-            let report = if state == "running" {
+            let report = if state == "running" || state == "queued" {
                 &Value::Null
             } else if status {
                 &record["result"]
@@ -412,7 +412,7 @@ pub fn client_output(value: &Value, waiting: bool, verbose: bool) -> Option<Valu
                     .unwrap_or(""),
                 400,
             );
-            let executor = if state == "running" {
+            let executor = if state == "running" || state == "queued" {
                 serde_json::from_value::<crate::protocol::Backend>(task["backend"].clone())
                     .ok()
                     .map(|backend| {

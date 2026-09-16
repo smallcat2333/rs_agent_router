@@ -1,4 +1,4 @@
-//! 任务契约及 Claude/Codex 事件归一；CLI 退出码和协议完成事件共同决定成功。
+//! 任务契约及 Claude/Codex/OpenCode 事件归一；退出码和协议完成事件共同决定成功。
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub enum Backend {
     Claude,
     Codex,
+    Opencode,
 }
 impl Backend {
     /// 配置表的 CLI 键，和模型名称无关。
@@ -17,7 +18,12 @@ impl Backend {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Opencode => "opencode",
         }
+    }
+    /// UI 与提交归属统一使用 CLI 简称。
+    pub fn short(self) -> &'static str {
+        match self { Self::Claude => "cc", Self::Codex => "cx", Self::Opencode => "oc" }
     }
 }
 
@@ -31,7 +37,7 @@ pub struct Profile {
     pub effort: Option<String>,
 }
 
-/// 配置按 claude/glm/codex 名称索引。
+/// 配置按 claude/codex/opencode 名称索引。
 pub type Profiles = BTreeMap<String, Profile>;
 
 /// Harness 只描述工作；CLI、模型、强度及执行权限由管理页决定。
@@ -52,7 +58,13 @@ pub struct Work {
 pub struct Routing {
     pub backend: Backend,
     pub allow_edits: bool,
+    pub clean_start: bool,
     pub timeout_seconds: u64,
+    pub retry_timeout_seconds: u64,
+}
+/// 默认给异常请求重试六十秒，独立于普通无输出超时。
+pub fn default_retry_timeout_seconds() -> u64 {
+    60
 }
 impl Default for Routing {
     /// 默认只读 Claude CLI，模型和强度取应用配置。
@@ -60,7 +72,9 @@ impl Default for Routing {
         Self {
             backend: Backend::Claude,
             allow_edits: false,
+            clean_start: true,
             timeout_seconds: 300,
+            retry_timeout_seconds: default_retry_timeout_seconds(),
         }
     }
 }
@@ -90,7 +104,9 @@ impl Work {
             model: profile.model.clone(),
             effort: profile.effort.clone(),
             allow_edits: routing.allow_edits,
+            clean_start: routing.backend == Backend::Claude && routing.clean_start,
             timeout_seconds: routing.timeout_seconds,
+            retry_timeout_seconds: routing.retry_timeout_seconds,
             resume_session: None,
         }
     }
@@ -114,7 +130,12 @@ pub struct Task {
     #[serde(skip)]
     pub resume_session: Option<String>,
     pub allow_edits: bool,
+    /// 新任务保存启动模式；旧记录缺少该字段时保留原来的非纯净会话行为。
+    #[serde(default)]
+    pub clean_start: bool,
     pub timeout_seconds: u64,
+    #[serde(default = "default_retry_timeout_seconds")]
+    pub retry_timeout_seconds: u64,
 }
 
 impl Task {
@@ -135,6 +156,7 @@ impl Task {
         );
         ensure!(!self.prompt.trim().is_empty(), "prompt is empty");
         ensure!(self.timeout_seconds > 0, "timeout_seconds must be positive");
+        ensure!(self.retry_timeout_seconds > 0, "retry_timeout_seconds must be positive");
         ensure!(
             self.group_path.len() <= 3 && self.group_path.iter().all(|s| !s.trim().is_empty()),
             "group_path must contain zero to three non-empty names"
@@ -150,16 +172,15 @@ impl Task {
     }
     /// 返回配置索引名称，不把模型名字误认为 CLI 类型。
     pub fn profile_key(&self) -> &'static str {
-        match self.backend {
-            Backend::Claude => "claude",
-            Backend::Codex => "codex",
-        }
+        self.backend.key()
     }
 }
 
 /// 协议累计状态；原始事件另外逐行落盘，不依赖界面保留全部输出。
 #[derive(Debug, Default, Serialize)]
 pub struct Outcome {
+    pub error: Option<String>,
+    pub message_id: Option<String>,
     pub session_id: Option<String>,
     pub cli_model: Option<String>,
     pub reported_model: Option<String>,
@@ -174,6 +195,9 @@ pub struct Outcome {
 impl Outcome {
     /// 解析已知事件；未知事件保留于原始日志，绝不伪造成功。
     pub fn observe(&mut self, backend: Backend, value: &Value) -> Vec<String> {
+        if backend == Backend::Opencode {
+            return crate::opencode::observe(self, value);
+        }
         let mut lines = Vec::new();
         let kind = value["type"].as_str().unwrap_or("");
         if backend != Backend::Codex {
@@ -193,7 +217,7 @@ impl Outcome {
                 } else {
                     &value["event"]["message"]["model"]
                 };
-                if let Some(model) = model.as_str().filter(|m| !m.is_empty()) {
+                if let Some(model) = model.as_str().filter(|m| crate::metrics::explicit_model(m)) {
                     self.reported_model = Some(model.to_owned());
                 }
             }
@@ -294,11 +318,19 @@ mod tests {
         );
         assert_eq!(outcome.cli_model.as_deref(), Some("GLM-5.3"));
         assert!(outcome.reported_model.is_none());
+        for model in ["glm-5.3", "deepseek-v4-pro", "<synthetic>"] {
+            outcome.metrics.observe(Backend::Claude,
+                &json!({"type":"assistant","message":{"model":model,"content":[]}}), 0);
+            outcome.observe(Backend::Claude,
+                &json!({"type":"assistant","message":{"model":model,"content":[]}}));
+        }
+        assert_eq!(outcome.reported_model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(outcome.metrics.reported_model.as_deref(), Some("deepseek-v4-pro"));
         outcome.observe(
             Backend::Claude,
             &json!({"type":"assistant","message":{"model":"auto","content":[]}}),
         );
-        assert_eq!(outcome.reported_model.as_deref(), Some("auto"));
+        assert_eq!(outcome.reported_model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(outcome.cli_model.as_deref(), Some("GLM-5.3"));
     }
     /// 分组最多三级，空分组允许，超深和空名称必须拒绝。
@@ -326,7 +358,9 @@ mod tests {
             "model",
             "effort",
             "allow_edits",
+            "clean_start",
             "timeout_seconds",
+            "retry_timeout_seconds",
         ] {
             let mut bad = value.clone();
             bad[key] = json!("override");
@@ -336,7 +370,9 @@ mod tests {
             &Routing {
                 backend: Backend::Claude,
                 allow_edits: true,
+                clean_start: true,
                 timeout_seconds: 300,
+                retry_timeout_seconds: 60,
             },
             &Profile {
                 program: PathBuf::new(),
@@ -348,6 +384,24 @@ mod tests {
         assert_eq!(task.model.as_deref(), Some("GLM-5.2"));
         assert_eq!(task.effort.as_deref(), Some("high"));
         assert!(task.allow_edits);
+        assert!(task.clean_start);
+    }
+    /// 设置只影响新任务；持久化显式保留模式，旧会话不能被误标为纯净。
+    #[test]
+    fn clean_start_snapshot_and_legacy_task() {
+        let work: Work = serde_json::from_value(json!({
+            "task_id":"clean", "workdir":std::env::temp_dir(), "prompt":"test"
+        })).unwrap();
+        let profile = Profile { program: "claude".into(), model: None, effort: None };
+        let mut routing = Routing::default();
+        let task = work.clone().resolve(&routing, &profile);
+        routing.clean_start = false;
+        assert!(task.clean_start);
+        assert!(!work.resolve(&routing, &profile).clean_start);
+        let mut saved = serde_json::to_value(&task).unwrap();
+        assert!(serde_json::from_value::<Task>(saved.clone()).unwrap().clean_start);
+        saved.as_object_mut().unwrap().remove("clean_start");
+        assert!(!serde_json::from_value::<Task>(saved).unwrap().clean_start);
     }
     /// 覆盖零退出码缺少协议结果、权限拒绝和正常 Claude 完成。
     #[test]

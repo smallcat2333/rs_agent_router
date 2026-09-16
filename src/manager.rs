@@ -1,4 +1,4 @@
-//! 常驻任务管理：无并发上限、独立取消、订阅、持久化和可控时钟归档。
+//! 常驻任务管理：并发限额与先进先出队列、独立取消、订阅及持久化。
 use crate::{
     ipc::{Envelope, Request},
     protocol::{Profiles, Routing, Work},
@@ -38,8 +38,10 @@ pub struct Manager {
     pub shutting_down: bool,
     pub error: String,
     pub archive_hours: u64,
+    pub max_parallel: usize,
     store: Store,
     running: HashMap<String, Running>,
+    pending: VecDeque<String>,
     subscribers: HashMap<String, Vec<SyncSender<Value>>>,
     last_archive: i64,
 }
@@ -77,8 +79,10 @@ impl Manager {
             shutting_down: false,
             error: String::new(),
             archive_hours,
+            max_parallel: 3,
             store,
             running: HashMap::new(),
+            pending: VecDeque::new(),
             subscribers: HashMap::new(),
             last_archive: now,
         })
@@ -87,7 +91,7 @@ impl Manager {
     pub fn running_count(&self) -> usize {
         self.running.len()
     }
-    /// 接收任务时固定模型配置快照，保存目录后立即启动，无队列。
+    /// 接收时固定执行快照；有空位立即启动，否则按接收顺序排队。
     pub fn submit(&mut self, work: Work, now: i64) -> Result<String> {
         ensure!(!self.shutting_down, "manager_shutdown: 管理页正在退出");
         let profile = self
@@ -103,7 +107,7 @@ impl Manager {
         );
         let directory = runner::prepare(&self.root, &task)?;
         let id = task.task_id.clone();
-        let record = Record {
+        let mut record = Record {
             reviews: Vec::new(),
             reworks: Vec::new(),
             turns: Vec::new(),
@@ -126,9 +130,45 @@ impl Manager {
             turn_started_at: now,
             deleted: false,
         };
-        self.launch_turn(&record)?;
+        self.schedule_turn(&mut record)?;
         self.records.insert(id.clone(), record);
         Ok(id)
+    }
+    /// 排队任务先落盘，不创建 CLI 线程，也不开始计算执行时间或超时。
+    fn schedule_turn(&mut self, record: &mut Record) -> Result<()> {
+        ensure!(self.max_parallel > 0, "最大并行必须大于零");
+        if self.running.len() < self.max_parallel && self.pending.is_empty() {
+            return self.launch_turn(record);
+        }
+        record.state = "queued".into();
+        record.result = Value::Null;
+        record.health = Health { phase: "queued".into(), ..Default::default() };
+        let directory = record.run_directory();
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(directory.join("request.json"), serde_json::to_vec_pretty(&record.task)?)?;
+        self.store.save(record)?;
+        self.pending.push_back(record.task.task_id.clone());
+        Ok(())
+    }
+    /// 空位按先入先出补齐；降低上限不抢占任务，启动失败也必须释放队首。
+    fn start_pending(&mut self, now: i64) -> Result<()> {
+        while !self.shutting_down && self.running.len() < self.max_parallel {
+            let Some(id) = self.pending.pop_front() else { break };
+            let mut record = self.records[&id].clone();
+            record.state = "running".into();
+            record.turn_started_at = now;
+            record.last_activity = now;
+            record.health = Health::default();
+            let launched = self.launch_turn(&record);
+            self.records.insert(id.clone(), record);
+            if let Err(error) = launched {
+                self.finish_task(&id, json!({"task_id":id,"state":"failed","duration_ms":0,
+                    "error_code":"launch_failed","error":format!("{error:#}"),"finished_at_ms":now}), now)?;
+            } else {
+                self.broadcast(&id, json!({"type":"progress","task_id":id,"state":"running","message":"排队结束，开始执行","timestamp_ms":now}));
+            }
+        }
+        Ok(())
     }
     /// 启动一轮并保存独立日志目录；调用前已验证同任务没有其它运行轮次。
     fn launch_turn(&mut self, record: &Record) -> Result<()> {
@@ -182,7 +222,7 @@ impl Manager {
         record.lines.clear();
         record.metrics = Default::default();
         record.health = Default::default();
-        self.launch_turn(&record)?;
+        self.schedule_turn(&mut record)?;
         self.records.insert(id.to_owned(), record);
         Ok(())
     }
@@ -280,7 +320,7 @@ impl Manager {
             turn: record.turn,
             created_at_ms: now,
         });
-        self.launch_turn(&record)?;
+        self.schedule_turn(&mut record)?;
         let turn = record.turn;
         self.records.insert(id.to_owned(), record);
         Ok((turn, false))
@@ -339,7 +379,13 @@ impl Manager {
         Ok(())
     }
     /// 请求取消但不提前宣布完成，等待进程树退出事件。
-    pub fn cancel(&self, id: &str) -> Result<()> {
+    pub fn cancel(&mut self, id: &str) -> Result<()> {
+        if self.records.get(id).is_some_and(|record| record.state == "queued") {
+            self.pending.retain(|pending| pending != id);
+            let now = runner::now_ms() as i64;
+            return self.finish_task(id, json!({"task_id":id,"state":"cancelled","duration_ms":0,
+                "error_code":"cancelled","error":"已取消排队任务","finished_at_ms":now}), now);
+        }
         let task = self
             .running
             .get(id)
@@ -350,6 +396,13 @@ impl Manager {
     /// 确认退出后拒绝新任务，并给每个运行线程标记管理器退出原因。
     pub fn shutdown(&mut self) {
         self.shutting_down = true;
+        let now = runner::now_ms() as i64;
+        while let Some(id) = self.pending.pop_front() {
+            if let Err(error) = self.finish_task(&id, json!({"task_id":id,"state":"cancelled",
+                "duration_ms":0,"finished_at_ms":now}), now) {
+                self.error = format!("排队任务退出保存失败：{error:#}");
+            }
+        }
         for task in self.running.values() {
             task.stop.store(2, Ordering::Relaxed);
         }
@@ -362,6 +415,9 @@ impl Manager {
     }
     /// 查询工作线程和其持有的进程句柄；静默输出不改变健康判断或活动排序。
     fn task_health(&self, id: &str) -> Health {
+        if self.records.get(id).is_some_and(|record| record.state == "queued") {
+            return Health { phase: "queued".into(), process_alive: Some(false), ..Default::default() };
+        }
         let Some(task) = self.running.get(id) else {
             return Health {
                 phase: "finished".into(),
@@ -516,6 +572,57 @@ impl Manager {
         }
         false
     }
+    /// 统一保存终态并通知订阅者；排队任务无需线程回收，执行任务先回收再释放名额。
+    fn finish_task(&mut self, id: &str, mut report: Value, now: i64) -> Result<()> {
+        if self.shutting_down {
+            report["state"] = json!("cancelled");
+            report["error_code"] = json!("manager_shutdown");
+            report["error"] = json!("管理页退出，任务已终止");
+        }
+        let record = self.records.get_mut(id).unwrap();
+        record.state = report["state"].as_str().unwrap_or("failed").to_owned();
+        record.finished_at = Some(report["finished_at_ms"].as_i64().unwrap_or(now));
+        record.last_activity = record.finished_at.unwrap().max(record.last_activity + 1);
+        record.current_tool.clear();
+        record.result = report;
+        record.elapsed_ms += record.result["duration_ms"]
+            .as_i64()
+            .unwrap_or_else(|| record.finished_at.unwrap() - record.turn_started_at)
+            .max(0);
+        if let Some(session) = record.result["outcome"]["session_id"].as_str() {
+            record.session_id = Some(session.to_owned());
+        }
+        crate::statistics::finish_turn(record);
+        let persistence = std::fs::write(
+            record.run_directory().join("result.json"),
+            serde_json::to_vec_pretty(&record.result)?,
+        )
+        .and_then(|_| std::fs::write(
+            record.directory.join("result.json"),
+            serde_json::to_vec_pretty(&record.result)?,
+        ))
+        .map_err(anyhow::Error::from)
+        .and_then(|_| self.store.save(record));
+        if let Err(error) = persistence {
+            // 不能因结果路径不可写而永远占用运行位；错误仍回传 Harness。
+            record.state = "failed".to_owned();
+            record.result["state"] = json!("failed");
+            record.result["error_code"] = json!("persistence_failed");
+            record.result["error"] = json!(format!("结果持久化失败：{error:#}"));
+            crate::statistics::finish_turn(record);
+            self.error = format!("任务 {id} 结果持久化失败：{error:#}");
+            let _ = self.store.save(record);
+        }
+        let response = json!({"type":"finished","task_id":id,"state":record.state,"elapsed_ms":record.elapsed_ms,"turn":record.turn,"rework_count":record.reworks.len(),"turn_result_path":record.run_directory().join("result.json"),"error_code":record.result["error_code"],"error":record.result["error"],"result_path":record.directory.join("result.json"),"result":record.result});
+        // 先回收线程，后发布任务完成，退出确认不能早于真正回收。
+        if let Some(task) = self.running.remove(id) {
+            let _ = task.worker.join();
+        }
+        self.broadcast(id, response);
+        self.subscribers.remove(id);
+
+        Ok(())
+    }
     /// 每次帧更新消费事件；同任务同帧只保存一次 SQLite，避免逐 token 写库。
     pub fn poll(&mut self, now: i64) -> Result<()> {
         let ids: Vec<_> = self.running.keys().cloned().collect();
@@ -545,7 +652,7 @@ impl Manager {
                         at_ms,
                     } => {
                         let record = self.records.get_mut(&id).unwrap();
-                        record.append(text.clone());
+                        record.append(text.clone(), at_ms);
                         if activity {
                             record.last_activity = at_ms.max(record.last_activity + 1);
                             if text.starts_with("工具调用") {
@@ -565,54 +672,15 @@ impl Manager {
                     json!({"task_id":id,"state":"failed","error_code":"worker_interrupted","error":"任务线程退出且未产生终态","finished_at_ms":now}),
                 );
             }
-            if let Some(mut report) = terminal {
-                if self.shutting_down {
-                    report["state"] = json!("cancelled");
-                    report["error_code"] = json!("manager_shutdown");
-                    report["error"] = json!("管理页退出，任务已终止");
-                }
-                let record = self.records.get_mut(&id).unwrap();
-                record.state = report["state"].as_str().unwrap_or("failed").to_owned();
-                record.finished_at = Some(report["finished_at_ms"].as_i64().unwrap_or(now));
-                record.last_activity = record.finished_at.unwrap().max(record.last_activity + 1);
-                record.current_tool.clear();
-                record.result = report;
-                record.elapsed_ms += record.result["duration_ms"]
-                    .as_i64()
-                    .unwrap_or_else(|| record.finished_at.unwrap() - record.turn_started_at)
-                    .max(0);
-                if let Some(session) = record.result["outcome"]["session_id"].as_str() {
-                    record.session_id = Some(session.to_owned());
-                }
-                crate::statistics::finish_turn(record);
-                let persistence = std::fs::write(
-                    record.directory.join("result.json"),
-                    serde_json::to_vec_pretty(&record.result)?,
-                )
-                .map_err(anyhow::Error::from)
-                .and_then(|_| self.store.save(record));
-                if let Err(error) = persistence {
-                    // 不能因结果路径不可写而永远占用运行位；错误仍回传 Harness。
-                    record.state = "failed".to_owned();
-                    record.result["state"] = json!("failed");
-                    record.result["error_code"] = json!("persistence_failed");
-                    record.result["error"] = json!(format!("结果持久化失败：{error:#}"));
-                    crate::statistics::finish_turn(record);
-                    self.error = format!("任务 {id} 结果持久化失败：{error:#}");
-                    let _ = self.store.save(record);
-                }
-                let response = json!({"type":"finished","task_id":id,"state":record.state,"elapsed_ms":record.elapsed_ms,"turn":record.turn,"rework_count":record.reworks.len(),"turn_result_path":record.run_directory().join("result.json"),"error_code":record.result["error_code"],"error":record.result["error"],"result_path":record.directory.join("result.json"),"result":record.result});
-                // 先回收线程，后发布任务完成，退出确认不能早于真正回收。
-                let task = self.running.remove(&id).unwrap();
-                let _ = task.worker.join();
-                self.broadcast(&id, response);
-                self.subscribers.remove(&id);
+            if let Some(report) = terminal {
+                self.finish_task(&id, report, now)?;
             } else if dirty {
                 self.store.save(&self.records[&id])?;
             }
             let health = self.task_health(&id);
             self.records.get_mut(&id).unwrap().health = health;
         }
+        self.start_pending(now)?;
         if now - self.last_archive >= 60000 {
             for record in self.records.values_mut() {
                 if record.archive_due_after(now, self.archive_hours as i64 * 3600000) {

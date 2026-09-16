@@ -137,7 +137,58 @@ mod tests {
         record.task.model = Some("glm-5.3".into());
         let args = crate::runner::arguments(&record.task, &profile);
         assert!(args.windows(2).any(|pair| pair == ["--effort", "max"]));
+        record.task.model = Some("muse-spark-1.3".into());
+        normalize(record.task.model.as_deref(), &mut record.task.effort);
+        assert_eq!(record.task.effort.as_deref(), Some("max"));
+        let args = crate::runner::arguments(&record.task, &profile);
+        assert!(args.windows(2).any(|pair| pair == ["--effort", "max"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "muse-spark-1.3"])
+        );
+        normalize(Some("muse-spark-1.3-contributor"), &mut record.task.effort);
+        assert_eq!(record.task.effort.as_deref(), Some("max"));
+        record.task.model = Some("muse-spark-1.3-contributor".into());
+        normalize(record.task.model.as_deref(), &mut record.task.effort);
+        let args = crate::runner::arguments(&record.task, &profile);
+        assert!(args.windows(2).any(|pair| pair == ["--effort", "max"]));
+        normalize(
+            Some("muse-spark-1.3-contributor-free"),
+            &mut record.task.effort,
+        );
+        assert_eq!(record.task.effort, None);
+        assert!(lookup(Some("muse-spark-1.2-contributor")).is_some());
         normalize(Some("claude-opus-4-5"), &mut record.task.effort);
         assert_eq!(record.task.effort, None);
+    }
+
+    /// 型号、计费版本及供应商不共享上限；仅有思考开关的模型不能保留旧强度。
+    #[test]
+    fn updated_catalog_keeps_model_boundaries() {
+        for (model, levels) in [
+            (
+                "muse-spark-1.3",
+                vec!["low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "muse-spark-1.3-contributor",
+                vec!["low", "medium", "high", "xhigh", "max"],
+            ),
+            ("grok-4.6", vec!["low", "medium", "high", "xhigh"]),
+            ("grok-4.5", vec!["low", "medium", "high"]),
+            ("qwen3.8-flash", vec!["low", "medium", "xhigh"]),
+            ("hy3", vec!["low", "high"]),
+            ("hy4-preview", vec!["high"]),
+        ] {
+            assert_eq!(lookup(Some(model)).unwrap().levels, levels, "{model}");
+        }
+        for model in ["minimax-m3", "mimo-v2.5", "longcat-2.0", "qwen3.7-max"] {
+            let mut effort = Some("max".to_owned());
+            normalize(Some(model), &mut effort);
+            assert_eq!(effort, None, "{model}");
+            assert!(lookup(Some(model)).unwrap().levels.is_empty());
+        }
+        assert!(lookup(Some("muse-spark-1.30")).is_none());
+        assert!(lookup(Some("grok-4.60")).is_none());
     }
 }

@@ -11,11 +11,98 @@ pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(66, 198, 180);
 pub const TEXT: egui::Color32 = egui::Color32::from_rgb(228, 235, 244);
 pub const MUTED: egui::Color32 = egui::Color32::from_rgb(144, 163, 186);
 
+/// 可见悬浮窗每秒恢复置顶层级；不依赖 egui 重绘，不激活窗口或重新显示已隐藏窗口。
+unsafe extern "system" fn overlay_topmost_timer(hwnd: windows_sys::Win32::Foundation::HWND, _: u32, _: usize, _: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    unsafe {
+        if !is_overlay(hwnd) || IsWindowVisible(hwnd) == 0 {
+            return;
+        }
+        if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0
+            && GetWindow(hwnd, GW_HWNDPREV).is_null()
+        {
+            return;
+        }
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+}
+
+thread_local! {
+    /// 仅 GUI 线程维护当前悬浮窗按钮的客户区像素坐标。
+    static OVERLAY_HITS: std::cell::RefCell<Option<(usize, [egui::Rect; 2])>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 即使窗口已穿透也能检测鼠标进入按钮；只切换命中样式，不重绘或改变透明度。
+unsafe extern "system" fn overlay_hit_timer(hwnd: windows_sys::Win32::Foundation::HWND, _: u32, _: usize, _: u32) {
+    use windows_sys::Win32::{Foundation::POINT, Graphics::Gdi::ScreenToClient, UI::WindowsAndMessaging::*};
+    OVERLAY_HITS.with(|state| {
+        if let Some((owner, areas)) = *state.borrow() {
+            if owner != hwnd as usize { return; }
+            unsafe {
+                let mut point = POINT { x: 0, y: 0 };
+                if GetCursorPos(&mut point) == 0 || ScreenToClient(hwnd, &mut point) == 0 { return; }
+                let over_button = areas.iter().any(|area| area.contains(egui::pos2(point.x as f32, point.y as f32)));
+                let old = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                // 按下后直到释放都保留输入，不能在一次点击中途撤销鼠标捕获。
+                if old & WS_EX_TRANSPARENT == 0
+                    && windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(1) < 0
+                { return; }
+                let style = if over_button { old & !WS_EX_TRANSPARENT } else { old | WS_EX_TRANSPARENT };
+                if style != old { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize); }
+            }
+        }
+    });
+}
+
+/// 模型菜单在滚动区外设定十行高度，避免弹层缓存的初始高度限制可见选项数。
+pub fn model_picker(ui: &mut egui::Ui, selected: &mut Option<String>, choices: &[String]) {
+    let popup_id = ui.make_persistent_id("model_picker_popup");
+    let button = ui.add_sized([160., 24.], egui::Button::new(""));
+    let color = ui.style().interact(&button).text_color();
+    let text_rect = egui::Rect::from_min_max(
+        button.rect.min + egui::vec2(6., 0.),
+        button.rect.max - egui::vec2(24., 0.),
+    );
+    ui.painter().with_clip_rect(text_rect.intersect(ui.clip_rect())).text(
+        text_rect.left_center(), egui::Align2::LEFT_CENTER,
+        selected.as_deref().unwrap_or("CLI 默认"),
+        egui::TextStyle::Button.resolve(ui.style()), color,
+    );
+    // 使用几何图形绘制箭头，不依赖字体是否包含下拉符号。
+    let center = egui::pos2(button.rect.right() - 12., button.rect.center().y);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![center + egui::vec2(-4., -2.), center + egui::vec2(4., -2.),
+             center + egui::vec2(0., 3.)],
+        color, egui::Stroke::NONE,
+    ));
+    if button.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    }
+    egui::popup::popup_below_widget(ui, popup_id, &button,
+        egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            let row_height = 26.;
+            let spacing = ui.spacing().item_spacing.y;
+            let rows = (choices.len() + 1).min(10);
+            let height = rows as f32 * (row_height + spacing);
+            ui.set_height(height);
+            egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                ui.spacing_mut().interact_size.y = row_height;
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.selectable_value(selected, None, "CLI 默认");
+                for model in choices {
+                    ui.selectable_value(selected, Some(model.clone()), model);
+                }
+            });
+        });
+}
+
 /// Windows 合成级透明、工具窗标记和圆角；缓存尺寸避免每次重绘都重设窗口区域。
 #[derive(Default)]
 pub struct OverlayWindow {
     hwnd: usize,
     shape: (i32, i32, i32),
+    topmost_timer_started: bool,
 }
 
 /// 仅匹配当前进程的悬浮窗，绝不修改其它应用或主管理窗口。
@@ -49,11 +136,32 @@ unsafe extern "system" fn find_overlay(
 }
 
 impl OverlayWindow {
+    /// 穿透时只保留清空与关闭两个命中区；16ms 原生计时器不触发 UI 重绘。
+    pub fn button_hit_regions(&mut self, passthrough: bool, areas: [egui::Rect; 2], scale: f32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        unsafe {
+            if !is_overlay(self.hwnd as _) { return; }
+            if passthrough {
+                OVERLAY_HITS.with(|state| *state.borrow_mut() = Some((self.hwnd, areas.map(|rect| {
+                    egui::Rect::from_min_max(rect.min * scale, rect.max * scale)
+                }))));
+                SetTimer(self.hwnd as _, 0x4152, 16, Some(overlay_hit_timer));
+                overlay_hit_timer(self.hwnd as _, 0, 0, 0);
+            } else {
+                KillTimer(self.hwnd as _, 0x4152);
+                OVERLAY_HITS.with(|state| *state.borrow_mut() = None);
+            }
+        }
+    }
     /// 先撤下原生表面并刷新原覆盖区域；随后由 egui 销毁视口，避免关闭末帧留下黑框。
     pub fn hide(&mut self) {
         use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
         unsafe {
             let hwnd = self.hwnd as _;
+            KillTimer(hwnd, 0x4152);
+            KillTimer(hwnd, 0x4153);
+            self.topmost_timer_started = false;
+            OVERLAY_HITS.with(|state| *state.borrow_mut() = None);
             if is_overlay(hwnd) && IsWindowVisible(hwnd) != 0 {
                 let mut rect: RECT = std::mem::zeroed();
                 let captured = GetWindowRect(hwnd, &mut rect) != 0;
@@ -69,8 +177,8 @@ impl OverlayWindow {
             }
         }
     }
-    /// 在原生窗口出现后应用 75% 不透明度、24px 圆角和非任务栏工具窗；失败明确返回。
-    pub fn apply(&mut self, pixels_per_point: f32) -> anyhow::Result<bool> {
+    /// 应用透明度、圆角与工具窗样式；穿透模式让鼠标命中下层窗口，退出该模式恢复交互。
+    pub fn apply(&mut self, pixels_per_point: f32, passthrough: bool) -> anyhow::Result<bool> {
         use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
         unsafe {
             if !is_overlay(self.hwnd as HWND) {
@@ -81,15 +189,22 @@ impl OverlayWindow {
                 }
                 self.hwnd = hwnd;
                 self.shape = (0, 0, 0);
+                self.topmost_timer_started = false;
             }
             let hwnd = self.hwnd as HWND;
             let old = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
             let style = (old | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
                 & !(WS_EX_APPWINDOW
+                    | WS_EX_TRANSPARENT
                     | WS_EX_WINDOWEDGE
                     | WS_EX_CLIENTEDGE
                     | WS_EX_STATICEDGE
                     | WS_EX_DLGMODALFRAME);
+            // 已启用局部穿透时由命中计时器维护该位，重绘不能先穿透再恢复而打断点击。
+            let hit_tracking = OVERLAY_HITS.with(|state| state.borrow().as_ref().is_some_and(|(owner, _)| *owner == self.hwnd));
+            let style = if passthrough {
+                style | if hit_tracking { old & WS_EX_TRANSPARENT } else { WS_EX_TRANSPARENT }
+            } else { style };
             // winit 无边框窗口仍保留 WS_CAPTION；移除原生装饰，阻止激活时重绘标题栏。
             let old_frame = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
             let frame = (old_frame
@@ -175,6 +290,20 @@ impl OverlayWindow {
             if reshow {
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             }
+            // Builder 的 AlwaysOnTop 只负责初始状态；真实层级改变后需原生恢复。
+            if old & WS_EX_TOPMOST == 0
+                && SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER) == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // 仅注册一次，避免持续重绘反复重置计时器、使回调永远无法到期。
+            if !self.topmost_timer_started {
+                if SetTimer(hwnd, 0x4153, 1000, Some(overlay_topmost_timer)) == 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                self.topmost_timer_started = true;
+            }
             Ok(true)
         }
     }
@@ -245,9 +374,14 @@ pub fn elapsed_text(milliseconds: i64) -> String {
     }
 }
 
-/// 最近有效活动的相对时间；仅展示，不写回活动时间或延长归档。
+/// 最近有效活动按整分钟显示，避免秒级跳动；不改变活动计时或归档。
 pub fn activity_age(last_activity: i64, now: i64) -> String {
-    format!("{}前", elapsed_text((now - last_activity).max(0)))
+    let minutes = now.saturating_sub(last_activity).max(0) / 60_000;
+    if minutes >= 60 {
+        format!("{}h{}m前", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}m前")
+    }
 }
 
 /// 小于千的 Token 显示整数，大数用 k/m；悬停可读原始精确值。
@@ -260,8 +394,36 @@ fn token_text(tokens: Option<u64>) -> String {
     }
 }
 
+/// 两个窗口共用输出 TPS；主界面解释测量口径，小窗保持无悬浮提示。
+fn output_throughput(ui: &mut egui::Ui, record: &Record, tooltip: bool) {
+    let metrics = &record.metrics;
+    let value = metrics.output_tps().map(|tps| {
+        let estimate = if metrics.tps_estimated { "≈" } else { "" };
+        format!("{estimate}{tps:.1}")
+    }).unwrap_or_else(|| "—".into());
+    let response = ui.label(egui::RichText::new(format!("TPS {value}")).small().color(ACCENT));
+    if tooltip {
+        let source = if record.task.backend == crate::protocol::Backend::Codex {
+            "Codex：输出 Token ÷ 排除工具执行后的模型阶段秒数；包含请求等待，≈ 表示近似值。"
+        } else if record.task.backend == crate::protocol::Backend::Opencode {
+            "OpenCode：已接入原生 Token 用量；未提供可靠的流式耗时，TPS 保持未知。"
+        } else {
+            "Claude：完整响应流的输出 Token ÷ 响应流秒数；不含首字等待、工具执行及子代理。"
+        };
+        let tokens = metrics.model_output_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "—".into());
+        response.on_hover_text(format!(
+            "{source}\n本次任务最近 10 轮（已有 {} 轮）配对输出：{tokens} Token；模型阶段：{:.3}s。每轮更新；输入与缓存不计入 TPS；计时或用量缺失时显示 —。",
+            metrics.throughput_samples.len(),
+            metrics.model_duration_ms as f64 / 1000.,
+        ));
+    }
+}
+
 /// 健康只描述操作系统进程证据；终态直接显示已结束，不冒充模型响应健康。
 fn health_label(record: &Record) -> (&str, egui::Color32) {
+    if record.state == "queued" {
+        return ("等待名额", state_color("queued"));
+    }
     if !record.running() {
         return ("已结束", MUTED);
     }
@@ -330,6 +492,7 @@ pub fn text_kind(line: &str) -> TextKind {
 /// 状态按执行结果统一着色：运行绿、完成蓝、超时黄、失败或中断红；主动取消保持灰色。
 pub fn state_color(state: &str) -> egui::Color32 {
     match state {
+        "queued" => egui::Color32::from_rgb(185, 145, 240),
         "running" => egui::Color32::from_rgb(100, 216, 170),
         "succeeded" => egui::Color32::from_rgb(119, 180, 251),
         "timed_out" => egui::Color32::from_rgb(245, 207, 92),
@@ -367,7 +530,7 @@ pub fn legend(ui: &mut egui::Ui) {
 }
 
 /// 主面板与悬浮窗共用最近五条平均耗时，悬停可读每条样本和实际计时口径。
-fn reply_latency(ui: &mut egui::Ui, record: &Record) {
+fn reply_latency(ui: &mut egui::Ui, record: &Record, tooltip: bool) {
     let replies = record.recent_replies();
     let average = if replies.is_empty() {
         "—".into()
@@ -398,12 +561,12 @@ fn reply_latency(ui: &mut egui::Ui, record: &Record) {
             reply.duration_ms as f64 / 1000.
         ));
     }
-    ui.label(
+    let response = ui.label(
         egui::RichText::new(format!("均耗时 {average}"))
             .small()
             .color(MUTED),
-    )
-    .on_hover_text(detail);
+    );
+    if tooltip { response.on_hover_text(detail); }
 }
 
 /// 结果及错误用独立卡片强调，全文仍可选择复制。
@@ -455,6 +618,7 @@ pub fn load_fonts(ctx: &egui::Context) {
 /// 树行和面板共用短状态名称，不显示内部日志。
 pub fn state_label(state: &str) -> &str {
     match state {
+        "queued" => "排队中",
         "running" => "运行中",
         "succeeded" => "已完成",
         "failed" => "失败",
@@ -665,6 +829,27 @@ pub fn tree(
     }
 }
 
+/// 将输出到达时间转为本机 H:MM:SS；耗时按下一条正文或结束时刻计算，时钟回拨不显示负数。
+fn output_time_label(at_ms: i64, end_ms: i64) -> String {
+    let seconds = end_ms.saturating_sub(at_ms).max(0) / 1000;
+    format!("{}({}m{}s)", local_time_label(at_ms), seconds / 60, seconds % 60)
+}
+
+/// 将日志时间统一转换为本机 H:MM:SS，供 CLI 与 DCR 的输出行复用。
+pub(crate) fn local_time_label(at_ms: i64) -> String {
+    use windows_sys::Win32::{Foundation::{FILETIME, SYSTEMTIME}, System::Time::*};
+    let ticks = ((at_ms as u64) + 11_644_473_600_000) * 10_000;
+    let filetime = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let mut utc: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    let mut local: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe {
+        assert_ne!(FileTimeToSystemTime(&filetime, &mut utc), 0, "invalid output timestamp");
+        assert_ne!(SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local), 0,
+            "cannot convert output timestamp to local time");
+    }
+    format!("{}:{:02}:{:02}", local.wHour, local.wMinute, local.wSecond)
+}
+
 /// 执行监控只显示 CLI 输出、结果和取消操作，不维护聊天输入或消息气泡。
 pub fn execution(ui: &mut egui::Ui, record: &Record, now: i64) -> Option<Action> {
     let mut action = None;
@@ -694,7 +879,7 @@ pub fn execution(ui: &mut egui::Ui, record: &Record, now: i64) -> Option<Action>
                 });
             });
             ui.horizontal(|ui| {
-              let model_width = (ui.available_width() - 385.).max(80.);
+              let model_width = (ui.available_width() - 455.).max(80.);
               ui.allocate_ui_with_layout(egui::vec2(model_width, 20.), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.set_min_width(model_width);
                 ui.add(
@@ -702,7 +887,7 @@ pub fn execution(ui: &mut egui::Ui, record: &Record, now: i64) -> Option<Action>
                     egui::RichText::new(format!(
                         "{} · 模型 {} · 强度 {}",
                         record.task.profile_key(),
-                        record.task.model.as_deref().unwrap_or("CLI 默认"),
+                        record.display_model(),
                         record.task.effort.as_deref().unwrap_or("默认")
                     ))
                     .color(MUTED)
@@ -713,7 +898,8 @@ pub fn execution(ui: &mut egui::Ui, record: &Record, now: i64) -> Option<Action>
               });
               ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                   let metrics = &record.metrics;
-                  reply_latency(ui, record);
+                  output_throughput(ui, record, true);
+                  reply_latency(ui, record, true);
                   let latency = metrics.first_text_ms.map(|ms| format!("{:.1}s", ms as f64 / 1000.)).unwrap_or_else(|| "—".into());
                   let label = if metrics.first_text_source.as_deref() == Some("completed_message") { "首段" } else { "首字" };
                   ui.label(egui::RichText::new(format!("{label} {latency}")).color(MUTED).size(12.))
@@ -771,25 +957,36 @@ pub fn execution(ui: &mut egui::Ui, record: &Record, now: i64) -> Option<Action>
                             .filter(|s| !s.is_empty())
                     };
                     let mut notes = Vec::new();
-                    let mut has_main = false;
+                    let mut main_lines = Vec::new();
                     for line in &record.lines {
-                        let kind = text_kind(line);
+                        let kind = text_kind(&line.text);
                         if matches!(kind, TextKind::Diagnostic | TextKind::Tool) {
-                            notes.push((kind, line));
+                            notes.push((kind, &line.text));
                             continue;
                         }
-                        if answer.is_some_and(|a| a.trim() == line.trim())
+                        if answer.is_some_and(|a| a.trim() == line.text.trim())
                             || (kind == TextKind::Result && answer.is_some())
                         {
                             continue;
                         }
-                        if !has_main {
-                            ui.add_space(4.);
-                            ui.label(egui::RichText::new("执行输出").size(12.).color(MUTED));
-                            has_main = true;
-                        }
+                        main_lines.push((kind, line));
+                    }
+                    let has_main = !main_lines.is_empty();
+                    if has_main {
+                        ui.add_space(4.);
+                        ui.label(egui::RichText::new("执行输出").size(12.).color(MUTED));
+                    }
+                    for (index, (kind, line)) in main_lines.iter().enumerate() {
+                        let end_ms = main_lines.get(index + 1).map(|(_, next)| next.at_ms)
+                            .or(record.finished_at).unwrap_or(now);
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(&format!("{} ", output_time_label(line.at_ms, end_ms)), 0.,
+                            egui::TextFormat { font_id: font.clone(), color: MUTED, ..Default::default() });
+                        job.append(&line.text, 0.,
+                            egui::TextFormat { font_id: font, color: kind.color(), ..Default::default() });
                         ui.add(
-                            egui::Label::new(egui::RichText::new(line).color(kind.color()))
+                            egui::Label::new(job)
                                 .wrap()
                                 .selectable(true),
                         );
@@ -870,8 +1067,8 @@ pub fn floating_size(count: usize, monitor_height: Option<f32>) -> egui::Vec2 {
     )
 }
 
-/// 拖动区与两个按钮独立命中；返回关闭、开始拖动、清空终态任务的意图。
-pub fn floating_header(ui: &mut egui::Ui, running: usize, model: &str) -> (bool, bool, bool) {
+/// 图标和标题共用拖动区，与两个按钮独立命中；返回关闭、拖动、清空终态任务的意图。
+pub fn floating_header(ui: &mut egui::Ui, running: usize, model: &str, logo: egui::TextureId) -> (bool, bool, bool) {
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 80.).max(80.);
         let drag = ui
@@ -880,24 +1077,23 @@ pub fn floating_header(ui: &mut egui::Ui, running: usize, model: &str) -> (bool,
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.set_min_width(width);
+                    ui.image((logo, egui::vec2(18., 18.)));
                     ui.label(egui::RichText::new("Agent Router").size(13.).strong());
                     ui.label(
                         egui::RichText::new(format!("{running} 运行"))
                             .size(11.)
                             .color(ACCENT),
                     );
-                    ui.add(
+                    let (position, galley, _) =
                         egui::Label::new(egui::RichText::new(model).size(11.).color(MUTED))
-                            .truncate(),
-                    );
+                            .truncate().layout_in_ui(ui);
+                    ui.painter().galley(position, galley, MUTED);
                 },
             )
             .response
             .interact(egui::Sense::drag());
         let clear = ui
-            .add_sized([46., 22.], egui::Button::new("清空").corner_radius(6))
-            .on_hover_text("清理已结束任务，保留运行任务和日志")
-            .clicked();
+            .add_sized([46., 22.], egui::Button::new("清空").corner_radius(6));
         let close = ui
             .scope(|ui| {
                 // 固定正方形命中区和零内边距，圆角半径为直径的一半。
@@ -913,11 +1109,10 @@ pub fn floating_header(ui: &mut egui::Ui, running: usize, model: &str) -> (bool,
                     .stroke(egui::Stroke::NONE)
                     .corner_radius(11),
                 )
-                .on_hover_text("关闭悬浮卡片")
-                .clicked()
             })
             .inner;
-        (close, drag.drag_started(), clear)
+        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("floating_button_rects"), [clear.rect, close.rect]));
+        (close.clicked(), drag.drag_started(), clear.clicked())
     })
     .inner
 }
@@ -946,7 +1141,7 @@ pub fn floating_summary(ui: &mut egui::Ui, record: &Record, now: i64) {
                     ).size().x
                 });
                 let title_width = (ui.available_width() - trailing_width - 72.).max(30.);
-                let title = ui
+                ui
                     .allocate_ui_with_layout(
                         egui::vec2(title_width, 22.),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -959,21 +1154,10 @@ pub fn floating_summary(ui: &mut egui::Ui, record: &Record, now: i64) {
                             ui.painter().galley(position, galley, TEXT);
                             response
                         },
-                    )
-                    .inner;
-                title.on_hover_text(format!(
-                    "{}\n{} · {} · {}\n耗时 {} · 最近活动 {}",
-                    record.task.label(),
-                    record.task.profile_key(),
-                    record.task.model.as_deref().unwrap_or("CLI 默认"),
-                    record.task.effort.as_deref().unwrap_or("默认强度"),
-                    elapsed_text(record.elapsed(now)),
-                    activity_age(record.last_activity, now)
-                ));
+                    );
                 badge(ui, state_label(&record.state), state_color(&record.state));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(age).size(11.).color(MUTED))
-                        .on_hover_text("距离最近有效活动的时间");
+                    ui.label(egui::RichText::new(age).size(11.).color(MUTED));
                     ui.label(egui::RichText::new(health).size(11.).color(color));
                 });
             });
@@ -990,8 +1174,7 @@ pub fn floating_summary(ui: &mut egui::Ui, record: &Record, now: i64) {
                     ))
                     .small()
                     .color(MUTED),
-                )
-                .on_hover_text("最近一轮的执行耗时");
+                );
                 ui.label(
                     egui::RichText::new(format!(
                         "上下文 {}",
@@ -1022,7 +1205,8 @@ pub fn floating_summary(ui: &mut egui::Ui, record: &Record, now: i64) {
                             .color(MUTED),
                     );
                 }
-                reply_latency(ui, record);
+                reply_latency(ui, record, false);
+                output_throughput(ui, record, false);
             });
             let text = if record.running() {
                 if record.current_tool.is_empty() {
@@ -1054,16 +1238,91 @@ pub fn floating_summary(ui: &mut egui::Ui, record: &Record, now: i64) {
             job.wrap.max_rows = 2;
             job.wrap.break_anywhere = true;
             let galley = ui.fonts(|fonts| fonts.layout_job(job));
-            let (rect, response) =
+            let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.), egui::Sense::hover());
             ui.painter().galley(rect.min, galley, color);
-            response.on_hover_text(text);
         });
 }
 
 #[cfg(test)]
 mod tests {
+    /// 实际渲染验证灰色前缀、正文保色、工具不截断计时，以及下一条和终态固定耗时。
+    #[test]
+    fn output_timestamps_accumulate_then_freeze() {
+        let ctx = egui::Context::default();
+        let mut record = crate::store::tests::sample("output-time");
+        record.state = "running".into();
+        record.finished_at = None;
+        let start = 1_789_430_400_000;
+        record.append("First output".into(), start);
+        record.append("工具调用 test".into(), start + 10_000);
+        /// 抽取实际执行卡片的排版任务，供断言文字和分段颜色。
+        fn jobs(ctx: &egui::Context, record: &Record, now: i64) -> Vec<egui::text::LayoutJob> {
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 1800.))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { execution(ui, record, now); });
+            });
+            output.shapes.into_iter().filter_map(|shape| {
+                if let egui::Shape::Text(text) = shape.shape { Some(text.galley.job.as_ref().clone()) } else { None }
+            }).collect()
+        }
+        for seconds in [0, 61, 121] {
+            let rendered = jobs(&ctx, &record, start + seconds * 1000);
+            let line = rendered.iter().find(|job| job.text.ends_with(" First output")).unwrap();
+            assert_eq!(line.text, format!("{} First output", output_time_label(start, start + seconds * 1000)));
+            assert_eq!(line.sections[0].format.color, MUTED);
+            assert_eq!(line.sections[1].format.color, text_kind("First output").color());
+        }
+        record.append("Second output".into(), start + 121_000);
+        record.state = "succeeded".into();
+        record.finished_at = Some(start + 183_000);
+        let rendered = jobs(&ctx, &record, start + 900_000);
+        assert!(rendered.iter().any(|job| job.text.ends_with("(2m1s) First output")));
+        assert!(rendered.iter().any(|job| job.text.ends_with("(1m2s) Second output")));
+        assert!(output_time_label(start, start - 1000).ends_with("(0m0s)"));
+        assert!(output_time_label(start, start + 3_661_000).ends_with("(61m1s)"));
+    }
     use super::*;
+    /// 在实际顶部水平滚动区中打开弹层，前十个选项必须完整落在裁剪区域内。
+    #[test]
+    fn model_popup_shows_ten_rows() {
+        let ctx = egui::Context::default();
+        load_fonts(&ctx);
+        apply_theme(&ctx);
+        let choices: Vec<String> = (1..=15).map(|i| format!("model-{i:02}")).collect();
+        let mut selected = None;
+        for _ in 0..3 {
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 800.))),
+                ..Default::default()
+            }, |ctx| {
+                egui::TopBottomPanel::top("top").show(ctx, |ui| {
+                    ui.add_space(40.);
+                    egui::ScrollArea::horizontal().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.set_height(26.);
+                            ui.memory_mut(|memory| memory.open_popup(ui.make_persistent_id("model_picker_popup")));
+                            model_picker(ui, &mut selected, &choices);
+                        });
+                    });
+                });
+            });
+            if output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "model-09")) {
+                let visible = output.shapes.iter().filter(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        let label = text.galley.text();
+                        (label == "CLI 默认" || label.starts_with("model-"))
+                            && shape.clip_rect.contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                    } else { false }
+                }).count();
+                assert!(visible >= 10, "only {visible} rows visible");
+                return;
+            }
+        }
+        panic!("model popup did not render");
+    }
     /// 使用真实字体与主题检查四行卡片的行位置及窗口底部空白。
     #[test]
     fn floating_compact_rows_align_and_fit() {
@@ -1076,6 +1335,13 @@ mod tests {
         record.metrics.context_tokens = Some(130500);
         record.metrics.input_tokens = Some(648100);
         record.metrics.output_tokens = Some(1000);
+        record.metrics.model_output_tokens = Some(400);
+        record.metrics.model_duration_ms = 4000;
+        record.metrics.tps_estimated = true;
+        record.metrics.reply_durations.push_back(crate::metrics::ReplyDuration {
+            duration_ms: 23500,
+            source: "claude_stream".into(),
+        });
         let size = floating_size(4, Some(1080.));
         let mut bottom = 0.;
         let output = ctx.run(
@@ -1087,7 +1353,7 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().inner_margin(8))
                     .show(ctx, |ui| {
-                        floating_header(ui, 0, "cc-glm-5.3-max");
+                        floating_header(ui, 0, "cc-glm-5.3-max", egui::TextureId::User(1));
                         ui.separator();
                         for _ in 0..4 {
                             floating_summary(ui, &record, 1000);
@@ -1102,8 +1368,10 @@ mod tests {
         assert!(title.x < status.x && status.x < health.x);
         assert!((title.y - health.y).abs() < 6.);
         let first = text_position(&output, "首字 6.8s");
-        let mean = text_position(&output, "均耗时 —");
+        let mean = text_position(&output, "均耗时 23.5s");
         assert!(first.x < mean.x && (first.y - mean.y).abs() < 2.);
+        let tps = text_position(&output, "TPS ≈100.0");
+        assert!(mean.x < tps.x && (mean.y - tps.y).abs() < 2.);
         let timing = text_position(
             &output,
             &format!(
@@ -1114,9 +1382,12 @@ mod tests {
         assert!(timing.x < first.x && (timing.y - first.y).abs() < 2.);
         let age = text_position(&output, &activity_age(record.last_activity, 1000));
         assert!(health.x < age.x && (health.y - age.y).abs() < 2.);
+        let mut metrics_checked = 0;
         for shape in &output.shapes {
             if let egui::epaint::Shape::Text(text) = &shape.shape {
-                if (text.pos.y - first.y).abs() < 2. {
+                // text_position 返回用于点击的内缩坐标，边界检查须还原为文字左上角。
+                if (text.pos.y - (first.y - 3.)).abs() < 2. {
+                    metrics_checked += 1;
                     assert!(
                         text.pos.x + text.galley.size().x <= size.x - 16.,
                         "{}: {}",
@@ -1126,12 +1397,59 @@ mod tests {
                 }
             }
         }
+        assert_eq!(metrics_checked, 6);
         assert!(
             size.y - bottom >= 5. && size.y - bottom <= 14.,
             "height={} bottom={bottom}",
             size.y
         );
     }
+    /// 主面板第二行按视觉顺序把 TPS 放在均耗时之后，较窄面板也不能裁掉指标。
+    #[test]
+    fn execution_tps_is_last_metric_and_fits() {
+        let ctx = egui::Context::default();
+        load_fonts(&ctx);
+        apply_theme(&ctx);
+        let mut record = crate::store::tests::sample("throughput");
+        record.task.model = Some("gpt-5.6-luna".into());
+        record.metrics.context_tokens = Some(130500);
+        record.metrics.input_tokens = Some(648100);
+        record.metrics.output_tokens = Some(1000);
+        record.metrics.first_text_ms = Some(6800);
+        record.metrics.reply_durations.push_back(crate::metrics::ReplyDuration {
+            duration_ms: 23500,
+            source: "codex_reply_cycle".into(),
+        });
+        record.metrics.model_output_tokens = Some(400);
+        record.metrics.model_duration_ms = 4000;
+        record.metrics.tps_estimated = true;
+        for width in [650., 1000.] {
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 400.))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    execution(ui, &record, 1000);
+                });
+            });
+            let mean = text_position(&output, "均耗时 23.5s");
+            let tps = text_position(&output, "TPS ≈100.0");
+            assert!(mean.x < tps.x && (mean.y - tps.y).abs() < 2.);
+            let mut metrics_checked = 0;
+            for shape in &output.shapes {
+                if let egui::epaint::Shape::Text(text) = &shape.shape
+                    && (text.pos.y - (tps.y - 3.)).abs() < 2.
+                {
+                    metrics_checked += 1;
+                    // 右对齐文字的 pos 是右侧锚点，galley.rect 才包含真实的左右边界。
+                    let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                    assert!(shape.clip_rect.contains_rect(bounds), "{} clipped at width {width}: text {bounds:?}, clip {:?}", text.galley.text(), shape.clip_rect);
+                }
+            }
+            assert!(metrics_checked >= 5);
+        }
+    }
+
     /// 隐藏的 Win32 测试窗口验证真实合成透明度、任务栏标志和圆角区域，不启动第二个管理器。
     #[test]
     fn native_overlay_is_layered_rounded_and_not_appwindow() {
@@ -1168,12 +1486,32 @@ mod tests {
             ));
             assert!(!window.0.is_null());
             let mut style = OverlayWindow::default();
-            assert!(style.apply(1.).unwrap());
+            assert!(style.apply(1., false).unwrap());
             let flags = GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32;
             assert_eq!(flags & WS_EX_APPWINDOW, 0);
             assert_ne!(flags & WS_EX_TOOLWINDOW, 0);
             assert_ne!(flags & WS_EX_LAYERED, 0);
             assert_ne!(flags & WS_EX_NOACTIVATE, 0);
+            assert_ne!(flags & WS_EX_TOPMOST, 0);
+            assert_eq!(flags & WS_EX_TRANSPARENT, 0);
+            assert!(style.apply(1., true).unwrap());
+            assert_ne!(GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT, 0);
+            assert!(style.apply(1., false).unwrap());
+            assert_eq!(GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT, 0);
+            let mut cursor = POINT { x: 0, y: 0 };
+            assert_ne!(GetCursorPos(&mut cursor), 0);
+            assert_ne!(windows_sys::Win32::Graphics::Gdi::ScreenToClient(window.0, &mut cursor), 0);
+            let point = egui::pos2(cursor.x as f32, cursor.y as f32);
+            let button_area = egui::Rect::from_center_size(point, egui::vec2(100., 100.));
+            style.button_hit_regions(true, [button_area; 2], 1.);
+            assert_eq!(GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT, 0);
+            // 重绘不能在鼠标已进入按钮后重新设成穿透，否则点击会丢失。
+            assert!(style.apply(1., true).unwrap());
+            assert_eq!(GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT, 0);
+            style.button_hit_regions(true, [button_area.translate(egui::vec2(1000., 1000.)); 2], 1.);
+            assert_ne!(GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT, 0);
+            style.button_hit_regions(false, [button_area; 2], 1.);
+            assert!(style.apply(1., false).unwrap());
             assert_eq!(
                 flags
                     & (WS_EX_WINDOWEDGE
@@ -1204,7 +1542,7 @@ mod tests {
             DeleteObject(region);
             // 模拟窗口重建样式后丢失 region；同样尺寸下也必须恢复。
             SetWindowRgn(window.0, std::ptr::null_mut(), 0);
-            assert!(style.apply(1.).unwrap());
+            assert!(style.apply(1., false).unwrap());
             let restored = CreateRectRgn(0, 0, 0, 0);
             assert_ne!(GetWindowRgn(window.0, restored), 0);
             assert_eq!(PtInRegion(restored, 0, 0), 0);
@@ -1220,7 +1558,35 @@ mod tests {
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
             ShowWindow(window.0, SW_SHOWNOACTIVATE);
+            // 模拟置顶丢失；无需打开主界面或重绘，原生回调即可恢复且不抢焦点。
+            let foreground = GetForegroundWindow();
+            assert_ne!(SetWindowPos(window.0, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE), 0);
+            assert_eq!(GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST, 0);
+            overlay_topmost_timer(window.0, 0, 0, 0);
+            assert_ne!(GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST, 0);
+            assert_eq!(GetForegroundWindow(), foreground);
+            // 另一置顶窗覆盖时，本窗置顶标志仍在；也必须恢复层级，不能只检查标志。
+            let cover = Window(CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                class.as_ptr(), class.as_ptr(), WS_POPUP,
+                -32000, -32000, 360, 388,
+                std::ptr::null_mut(), std::ptr::null_mut(),
+                std::ptr::null_mut(), std::ptr::null(),
+            ));
+            assert!(!cover.0.is_null());
+            ShowWindow(cover.0, SW_SHOWNOACTIVATE);
+            assert_ne!(SetWindowPos(cover.0, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE), 0);
+            assert_ne!(GetWindowLongPtrW(window.0, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST, 0);
+            overlay_topmost_timer(window.0, 0, 0, 0);
+            assert_eq!(GetWindow(cover.0, GW_HWNDPREV), window.0);
+            assert_eq!(GetForegroundWindow(), foreground);
+            drop(cover);
             style.hide();
+            assert_eq!(IsWindowVisible(window.0), 0);
+            assert!(!style.topmost_timer_started);
+            overlay_topmost_timer(window.0, 0, 0, 0);
             assert_eq!(IsWindowVisible(window.0), 0);
         }
     }
@@ -1234,14 +1600,14 @@ mod tests {
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(360., 388.),
+                        floating_size(4, None),
                     )),
                     events,
                     ..Default::default()
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        action = floating_header(ui, 3, "cx-gpt-5.6-luna-max");
+                        action = floating_header(ui, 3, "cx-gpt-5.6-luna-max", egui::TextureId::User(1));
                     });
                 },
             );
@@ -1281,7 +1647,10 @@ mod tests {
             assert_eq!(elapsed_text(ms), expected);
         }
         assert_eq!(activity_age(0, 18120000), "5h2m前");
-        assert_eq!(activity_age(10, 0), "0s前");
+        assert_eq!(activity_age(10, 0), "0m前");
+        assert_eq!(activity_age(0, 59_999), "0m前");
+        assert_eq!(activity_age(0, 60_000), "1m前");
+        assert_eq!(activity_age(0, 3_600_000), "1h0m前");
         assert_eq!(token_text(None), "—");
     }
     /// 已有工具和诊断前缀收进辅助区，执行正文与最终结果保持独立。
@@ -1338,7 +1707,7 @@ mod tests {
         let mut record = crate::store::tests::sample("nested-item");
         record.task.group_path = vec!["source".into(), "app".into(), "feat".into()];
         let (first, _) = render(&ctx, &record, vec![]);
-        let group = text_position(&first, "source (1) · 0s前");
+        let group = text_position(&first, "source (1) · 0m前");
         render(
             &ctx,
             &record,

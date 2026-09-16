@@ -1,13 +1,18 @@
 //! 单实例管理页及 Harness CLI 客户端；命令行只负责派发，不拥有任务进程。
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod ipc;
+mod dcr;
+mod dcr_session;
+mod dcr_view;
 mod launcher;
 mod manager;
 mod metrics;
 mod model_catalog;
 mod model_efforts;
+mod opencode;
 mod protocol;
 mod review;
+mod retry_watch;
 mod runner;
 #[cfg(test)]
 #[path = "../tests/support/service.rs"]
@@ -44,7 +49,7 @@ impl StartupPaths {
 
 /// 启动配置仅在创建管理实例时生效。
 #[derive(Parser)]
-#[command(version, about = "Unified Claude / GLM / Codex task manager")]
+#[command(version, about = "Unified Claude / Codex / OpenCode task manager")]
 struct Args {
     #[arg(long, global = true)]
     config: Option<PathBuf>,

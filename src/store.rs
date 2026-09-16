@@ -21,6 +21,13 @@ pub struct Health {
     pub worker_alive: bool,
 }
 
+/// 一条完整执行输出及其到达时间；仅用于内存展示，不改写原始文本或磁盘日志。
+#[derive(Clone, Debug)]
+pub struct OutputLine {
+    pub text: String,
+    pub at_ms: i64,
+}
+
 /// 单个任务的持久状态；日志缓存不写入 SQLite，原始文件是真源。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
@@ -56,7 +63,7 @@ pub struct Record {
     #[serde(default)]
     pub deleted: bool,
     #[serde(skip)]
-    pub lines: VecDeque<String>,
+    pub lines: VecDeque<OutputLine>,
 }
 
 impl Record {
@@ -75,6 +82,14 @@ impl Record {
             )
             .take(5)
             .collect()
+    }
+    /// 优先展示最新回复模型；旧记录读取结果证据，没有实际证据才展示启动配置。
+    pub fn display_model(&self) -> &str {
+        self.metrics.reported_model.as_deref()
+            .or_else(|| self.result["outcome"]["reported_model"].as_str()
+                .filter(|model| crate::metrics::explicit_model(model)))
+            .or(self.task.model.as_deref())
+            .unwrap_or("CLI 默认")
     }
     /// 当前评分只属于当前轮；启动新轮不会把历史分数冒充新结果。
     pub fn current_review(&self) -> Option<&crate::review::ReviewRecord> {
@@ -103,7 +118,7 @@ impl Record {
     /// 运行时间累计各轮执行，不把两轮之间的等待时间算作执行。
     pub fn elapsed(&self, now: i64) -> i64 {
         self.elapsed_ms
-            + if self.running() {
+            + if self.state == "running" {
                 (now - self.turn_started_at).max(0)
             } else {
                 0
@@ -111,15 +126,17 @@ impl Record {
     }
     /// 最近一轮耗时和累计会话耗时分开；正在执行时只计当前轮次。
     pub fn turn_elapsed(&self, now: i64) -> i64 {
-        if self.running() {
+        if self.state == "queued" {
+            0
+        } else if self.state == "running" {
             (now - self.turn_started_at).max(0)
         } else {
             self.result["duration_ms"].as_i64().unwrap_or(0)
         }
     }
-    /// 运行状态以管理器登记为准，不从窗口可见性推断。
+    /// 未结束的活动任务包含排队，统一阻止重复续聊、归档及删除。
     pub fn running(&self) -> bool {
-        self.state == "running"
+        matches!(self.state.as_str(), "running" | "queued")
     }
     /// 只用结束时间计算归档，阅读和活动排序不延长保留时间。
     #[cfg(test)]
@@ -134,8 +151,8 @@ impl Record {
             && self.finished_at.is_some_and(|end| now - end >= after_ms)
     }
     /// 限制内存展示缓存，磁盘完整日志不裁剪。
-    pub fn append(&mut self, text: String) {
-        self.lines.push_back(text);
+    pub fn append(&mut self, text: String, at_ms: i64) {
+        self.lines.push_back(OutputLine { text, at_ms });
         if self.lines.len() > 200 {
             self.lines.pop_front();
         }
@@ -264,6 +281,20 @@ pub fn recent_with_limit(records: impl Iterator<Item = Record>, limit: usize) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    /// 历史结果与实时模型优先于启动配置，错误占位模型不会冒充实际模型。
+    #[test]
+    fn model_display_uses_latest_reply_evidence() {
+        let mut record = sample("model");
+        record.task.model = Some("glm-5.3".into());
+        assert_eq!(record.display_model(), "glm-5.3");
+        record.result = serde_json::json!({"outcome":{"reported_model":"deepseek-v4-pro"}});
+        assert_eq!(record.display_model(), "deepseek-v4-pro");
+        record.metrics.reported_model = Some("deepseek-flash".into());
+        assert_eq!(record.display_model(), "deepseek-flash");
+        record.metrics.reported_model = None;
+        record.result["outcome"]["reported_model"] = serde_json::json!("<synthetic>");
+        assert_eq!(record.display_model(), "glm-5.3");
+    }
     /// 历史 GLM 元数据迁移前备份数据库，日志不移动，旧会话不伪造恢复。
     #[test]
     fn legacy_glm_migrates_without_relocating_logs() {
@@ -489,7 +520,9 @@ pub(crate) mod tests {
                 effort: None,
                 resume_session: None,
                 allow_edits: false,
+                clean_start: true,
                 timeout_seconds: 1,
+                retry_timeout_seconds: 60,
             },
             directory: std::env::temp_dir(),
             state: "succeeded".to_owned(),
