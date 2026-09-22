@@ -13,6 +13,10 @@ pub fn discover(backend: Backend, program: &Path) -> Result<Vec<String>> {
     if backend == Backend::Codex {
         return codex_models(program);
     }
+    if backend == Backend::Agy {
+        // Antigravity 暂不支持自动模型发现，手动输入。
+        return Ok(Vec::new());
+    }
     let home = std::env::var_os("USERPROFILE").context("无法确定用户配置目录")?;
     let home = Path::new(&home);
     let database = home.join(".cc-switch/cc-switch.db");

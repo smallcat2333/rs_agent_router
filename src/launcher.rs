@@ -54,6 +54,12 @@ struct Preferences {
     floating_bottom: Option<[f32; 2]>,
     #[serde(default)]
     archived: bool,
+    /// Antigravity CLI 启用出站代理。
+    #[serde(default)]
+    agy_proxy_enabled: bool,
+    /// Antigravity CLI SOCKS5 代理地址，格式 ip:port。
+    #[serde(default)]
+    agy_proxy_socks5: String,
 }
 
 /// 首次启动及已有设置新增该选项时，默认不自动加载用户和项目指令文件。
@@ -384,6 +390,9 @@ impl Dashboard {
             clean_start: self.preferences.clean_start,
             timeout_seconds: self.preferences.timeout_seconds,
             retry_timeout_seconds: self.preferences.retry_timeout_seconds,
+            agy_proxy: if self.preferences.agy_proxy_enabled {
+                self.preferences.agy_proxy_socks5.clone()
+            } else { String::new() },
         };
         Ok(())
     }
@@ -645,6 +654,7 @@ impl eframe::App for Dashboard {
                                 "Codex",
                             );
                             ui.selectable_value(&mut self.preferences.backend, Backend::Opencode, "OpenCode");
+                            ui.selectable_value(&mut self.preferences.backend, Backend::Agy, "Antigravity");
                             let key = self.preferences.backend.key();
                             let profile =
                                 self.editing_profiles.entry(key.into()).or_insert(Profile {
@@ -808,6 +818,16 @@ impl eframe::App for Dashboard {
                                 self.dcr_open = true;
                             }
                             ui.label(self.dcr.status());
+                            if self.preferences.backend == Backend::Agy {
+                                ui.separator();
+                                ui.checkbox(&mut self.preferences.agy_proxy_enabled, "启用代理");
+                                if self.preferences.agy_proxy_enabled {
+                                    ui.label("SOCKS5");
+                                    ui.add(egui::TextEdit::singleline(&mut self.preferences.agy_proxy_socks5)
+                                        .desired_width(140.)
+                                        .hint_text("127.0.0.1:11808"));
+                                }
+                            }
                         });
                     });
                 self.preferences.floating = self.floating.load(Ordering::Relaxed);
@@ -1056,6 +1076,15 @@ impl eframe::App for Dashboard {
     }
 }
 
+/// 尝试从 PATH 中定位 agy 可执行文件，找不到返回 None。
+fn which_agy() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("agy.exe"))
+            .find(|path| path.is_file())
+    })
+}
+
 /// 创建管理页和托盘；调度线程在隐藏期间照常消费命令、输出和归档。
 pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
     let loaded: Result<Profiles> = (|| Ok(serde_json::from_slice(&std::fs::read(&config)?)?))();
@@ -1091,6 +1120,8 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
             main_size: None,
             floating_bottom: None,
             archived: false,
+            agy_proxy_enabled: false,
+            agy_proxy_socks5: String::new(),
         },
         Err(e) => return Err(e.into()),
     };
@@ -1099,7 +1130,7 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
             profiles.insert("claude".into(), profile);
         }
     }
-    profiles.retain(|key, _| key == "claude" || key == "codex" || key == "opencode");
+    profiles.retain(|key, _| key == "claude" || key == "codex" || key == "opencode" || key == "agy");
     let manager = Arc::new(Mutex::new(Manager::new_with_archive(
         root,
         profiles.clone(),
@@ -1113,6 +1144,9 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
         clean_start: preferences.clean_start,
         timeout_seconds: preferences.timeout_seconds,
         retry_timeout_seconds: preferences.retry_timeout_seconds,
+        agy_proxy: if preferences.agy_proxy_enabled {
+            preferences.agy_proxy_socks5.clone()
+        } else { String::new() },
     };
     let (tx, rx) = mpsc::channel();
     let statistics = crate::webstats::WebStats::start(tx.clone())?;

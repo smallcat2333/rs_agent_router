@@ -11,6 +11,7 @@ pub enum Backend {
     Claude,
     Codex,
     Opencode,
+    Agy,
 }
 impl Backend {
     /// 配置表的 CLI 键，和模型名称无关。
@@ -19,11 +20,12 @@ impl Backend {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Agy => "agy",
         }
     }
     /// UI 与提交归属统一使用 CLI 简称。
     pub fn short(self) -> &'static str {
-        match self { Self::Claude => "cc", Self::Codex => "cx", Self::Opencode => "oc" }
+        match self { Self::Claude => "cc", Self::Codex => "cx", Self::Opencode => "oc", Self::Agy => "agy" }
     }
 }
 
@@ -61,6 +63,8 @@ pub struct Routing {
     pub clean_start: bool,
     pub timeout_seconds: u64,
     pub retry_timeout_seconds: u64,
+    /// Agy 后端启用代理时的 SOCKS5 地址 (ip:port)；空串表示不启用。
+    pub agy_proxy: String,
 }
 /// 默认给异常请求重试六十秒，独立于普通无输出超时。
 pub fn default_retry_timeout_seconds() -> u64 {
@@ -75,6 +79,7 @@ impl Default for Routing {
             clean_start: true,
             timeout_seconds: 300,
             retry_timeout_seconds: default_retry_timeout_seconds(),
+            agy_proxy: String::new(),
         }
     }
 }
@@ -107,6 +112,7 @@ impl Work {
             clean_start: routing.backend == Backend::Claude && routing.clean_start,
             timeout_seconds: routing.timeout_seconds,
             retry_timeout_seconds: routing.retry_timeout_seconds,
+            agy_proxy: if routing.backend == Backend::Agy { routing.agy_proxy.clone() } else { String::new() },
             resume_session: None,
         }
     }
@@ -136,6 +142,9 @@ pub struct Task {
     pub timeout_seconds: u64,
     #[serde(default = "default_retry_timeout_seconds")]
     pub retry_timeout_seconds: u64,
+    /// Agy 后端代理地址快照，仅 Agy 任务时有值。
+    #[serde(default)]
+    pub agy_proxy: String,
 }
 
 impl Task {

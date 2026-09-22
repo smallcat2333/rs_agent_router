@@ -71,7 +71,16 @@ fn execution_prompt(prompt: &str) -> String {
 
 /// 构造逐项参数；提示词经 stdin 传输，避免 shell 转义和命令行长度限制。
 pub fn arguments(task: &Task, profile: &Profile) -> Vec<String> {
-    let mut args: Vec<String> = if task.backend == Backend::Opencode {
+    let mut args: Vec<String> = if task.backend == Backend::Agy {
+        // Antigravity CLI 使用与 Claude 兼容的 stream-json 输出。
+        vec![
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ]
+    } else if task.backend == Backend::Opencode {
         vec!["run", "--format", "json", "--thinking"]
     } else if task.backend == Backend::Codex {
         vec![
@@ -294,6 +303,14 @@ fn execute(
         .stdin(Stdin::Piped);
     if task.backend == Backend::Opencode {
         command = command.env(crate::opencode::environment(task.allow_edits));
+    }
+    if task.backend == Backend::Agy && !task.agy_proxy.is_empty() {
+        let socks_url = format!("socks5://{}", task.agy_proxy);
+        command = command.env(vec![
+            ("HTTP_PROXY".to_string(), socks_url.clone()),
+            ("HTTPS_PROXY".to_string(), socks_url.clone()),
+            ("ALL_PROXY".to_string(), socks_url),
+        ]);
     }
     let (handle, rx) = command.start()?;
     let child = ChildGuard(handle);
