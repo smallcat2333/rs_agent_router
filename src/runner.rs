@@ -60,9 +60,20 @@ fn publish(tx: &Sender<Update>, _task_id: &str, line: &str) {
     });
 }
 
+/// 每轮统一附加交付约束；保留原任务文本，不改变任务权限和明确禁止事项。
+fn execution_prompt(prompt: &str) -> String {
+    format!("Router 执行约束：\n\
+代码实现或修复任务，在任务授权范围内完成必要的自测：优先运行项目已有的相关测试或最小可运行验证，失败时修复后重测。不得只写测试而不运行、不得把静态阅读称为测试通过。明确要求不运行工具的任务遵从原要求。\n\
+命令执行仅用于本任务必要的检查、构建与测试，遵守指定目录、文件范围和禁止事项；不得借测试绕过只读权限或执行未授权的安装、网络、Git提交、部署、破坏性命令。\n\
+如缺少命令工具、环境或依赖，明确报告未执行的命令与阻塞原因，不能伪称已通过。修复涉及范围外文件时停止该修复并报告。\n\
+最终默认只回传：1. 修改文件清单及每项一句变化；2. 测试摘要（实际命令、退出码、通过/失败/未执行）；3. 失败证据与遗留阻塞（最小错误片段、日志或文件路径，无则写无）。完整代码和日志留本地，不复制回传，不重复任务全文，不自行评分。\n\n--- Router 任务正文 ---\n{prompt}")
+}
+
 /// 构造逐项参数；提示词经 stdin 传输，避免 shell 转义和命令行长度限制。
 pub fn arguments(task: &Task, profile: &Profile) -> Vec<String> {
-    let mut args: Vec<String> = if task.backend == Backend::Codex {
+    let mut args: Vec<String> = if task.backend == Backend::Opencode {
+        vec!["run", "--format", "json", "--thinking"]
+    } else if task.backend == Backend::Codex {
         vec![
             "exec",
             "--json",
@@ -88,13 +99,13 @@ pub fn arguments(task: &Task, profile: &Profile) -> Vec<String> {
             "dontAsk",
             "--tools",
             if task.allow_edits {
-                "Read,Glob,Grep,Edit,Write"
+                "Read,Glob,Grep,Edit,Write,Bash"
             } else {
                 "Read,Glob,Grep"
             },
             "--allowedTools",
             if task.allow_edits {
-                "Read,Glob,Grep,Edit,Write"
+                "Read,Glob,Grep,Edit,Write,Bash"
             } else {
                 "Read,Glob,Grep"
             },
@@ -103,12 +114,18 @@ pub fn arguments(task: &Task, profile: &Profile) -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect();
+    if task.clean_start && task.backend == Backend::Claude {
+        // 只改变指令自动加载，不更换认证、模型或既有工具权限。
+        args.push("--safe-mode".to_owned());
+    }
     if let Some(model) = task.model.as_ref().or(profile.model.as_ref()) {
         args.extend(["--model".to_owned(), model.clone()]);
     }
     if let Some(effort) = task.effort.as_ref().or(profile.effort.as_ref()) {
         if task.backend == Backend::Codex {
             args.extend(["-c".to_owned(), format!("model_reasoning_effort={effort}")]);
+        } else if task.backend == Backend::Opencode {
+            args.extend(["--variant".to_owned(), effort.clone()]);
         } else {
             args.extend(["--effort".to_owned(), effort.clone()]);
         }
@@ -116,6 +133,8 @@ pub fn arguments(task: &Task, profile: &Profile) -> Vec<String> {
     if let Some(session) = &task.resume_session {
         if task.backend == Backend::Codex {
             args.extend(["resume".to_owned(), session.clone()]);
+        } else if task.backend == Backend::Opencode {
+            args.extend(["--session".to_owned(), session.clone()]);
         } else {
             args.extend(["--resume".to_owned(), session.clone()]);
         }
@@ -162,6 +181,21 @@ pub fn run(
     report["requested_effort"] = json!(task.effort);
     report["session_persisted"] = json!(true);
     report["router_version"] = json!(env!("CARGO_PKG_VERSION"));
+    if task.backend == Backend::Opencode && report["state"] == "failed" && report["error"].is_null() {
+        report["error_code"] = json!("opencode_error");
+        report["error"] = json!(report["outcome"]["error"].as_str().unwrap_or("OpenCode 未正常完成本轮请求"));
+    }
+    if task.backend == Backend::Opencode
+        && let (Some(session), Some(message)) = (report["outcome"]["session_id"].as_str(), report["outcome"]["message_id"].as_str())
+    {
+        match crate::opencode::identity(&profile.program, &task.workdir, session, message) {
+            Ok(model) => {
+                report["outcome"]["reported_model"] = json!(model);
+                report["outcome"]["metrics"]["reported_model"] = json!(model);
+            }
+            Err(error) => { report["identity_error"] = json!(error.to_string()); }
+        }
+    }
     report["executor"] = crate::metrics::executor(
         task.backend,
         task.model.as_deref().or(profile.model.as_deref()),
@@ -236,7 +270,12 @@ fn execute(
     cancel: Arc<AtomicU8>,
     tx: &Sender<Update>,
 ) -> Result<Value> {
-    let args = arguments(task, profile);
+    let launched_ms = now_ms() as u64;
+    let mut args = arguments(task, profile);
+    let debug_path = directory.join("claude-debug.log");
+    if task.backend == Backend::Claude {
+        args.extend(["--debug-file".to_owned(), debug_path.to_string_lossy().into_owned()]);
+    }
     fs::write(
         directory.join("launch.json"),
         serde_json::to_vec_pretty(
@@ -248,18 +287,21 @@ fn execute(
     let mut console = File::create(directory.join("console.log"))?;
     let mut events_file = File::create(directory.join("events.jsonl"))?;
     publish(tx, &task.task_id, "正在启动 CLI");
-    let (handle, rx) = Command::new(&profile.program)
+    let mut command = Command::new(&profile.program)
         .cwd(&task.workdir)
         .args(args)
         .run_id(&task.task_id)
-        .stdin(Stdin::Piped)
-        .start()?;
+        .stdin(Stdin::Piped);
+    if task.backend == Backend::Opencode {
+        command = command.env(crate::opencode::environment(task.allow_edits));
+    }
+    let (handle, rx) = command.start()?;
     let child = ChildGuard(handle);
     let _ = tx.send(Update::ProcessStarted(child.0.clone()));
     let pid = child.0.pid();
     // 单独发送长提示词，主事件循环持续排空 stdout，避免双向管道互相等待。
     let input_handle = child.0.clone();
-    let prompt = task.prompt.clone();
+    let prompt = execution_prompt(&task.prompt);
     let writer = std::thread::spawn(move || -> Result<()> {
         input_handle.write(prompt.as_bytes())?;
         input_handle.close_stdin()?;
@@ -268,12 +310,41 @@ fn execute(
     let start = Instant::now();
     let mut last_output = start;
     let idle_timeout = Duration::from_secs(task.timeout_seconds);
+    let retry_timeout = Duration::from_secs(task.retry_timeout_seconds);
+    let mut retry_watch = crate::retry_watch::RetryWatch::default();
+    let mut retry_timed_out = false;
     let mut stopped: Option<&str> = None;
     let mut outcome = Outcome::default();
+    let mut native = crate::metrics::CodexLiveMetrics::default();
+    let mut native_error = None;
+    // 每秒增量读取一次；终止后再排空，防止末轮用量落盘晚于 CLI 完成事件。
+    let mut refresh_metrics = |outcome: &mut Outcome| {
+        if task.backend == Backend::Codex && let Some(session) = outcome.session_id.as_deref() {
+            let old = outcome.metrics.clone();
+            match native.poll(session, launched_ms, &mut outcome.metrics) {
+                Ok(()) => native_error = None,
+                Err(error) => {
+                    let message = format!("原生 TPS 读取失败：{error:#}");
+                    if native_error.as_ref() != Some(&message) {
+                        publish(tx, &task.task_id, &message);
+                        native_error = Some(message);
+                    }
+                }
+            }
+            if old != outcome.metrics {
+                let _ = tx.send(Update::Metrics(Box::new(outcome.metrics.clone())));
+            }
+        }
+    };
+    let mut last_native_poll = Instant::now();
     let mut process_error = None;
     let mut last_text_activity = Instant::now();
     let exit_code;
     loop {
+        if last_native_poll.elapsed() >= Duration::from_secs(1) {
+            refresh_metrics(&mut outcome);
+            last_native_poll = Instant::now();
+        }
         if stopped.is_none() {
             if cancel.load(Ordering::Relaxed) != 0 {
                 stopped = Some("cancelled");
@@ -300,6 +371,9 @@ fn execute(
                         writeln!(raw, "{line}")?;
                         match serde_json::from_str::<Value>(&line) {
                             Ok(value) => {
+                                if crate::retry_watch::model_progress(&value) {
+                                    retry_watch.recovered();
+                                }
                                 let old = outcome.metrics.clone();
                                 outcome.metrics.observe(
                                     task.backend,
@@ -356,7 +430,20 @@ fn execute(
                 anyhow::bail!("process event stream closed without exit event")
             }
         }
-        if stopped.is_none() && last_output.elapsed() >= idle_timeout {
+        if task.backend == Backend::Claude && stopped.is_none() {
+            if retry_watch.poll(&debug_path, Instant::now())? {
+                let message = format!("上游请求异常，允许 CLI 重试 {} 秒；重复报错不延长等待", task.retry_timeout_seconds);
+                writeln!(console, "{message}")?;
+                publish(tx, &task.task_id, &message);
+            }
+            if retry_watch.expired(Instant::now(), retry_timeout) {
+                retry_timed_out = cancel.load(Ordering::Relaxed) == 0;
+                stopped = Some(if retry_timed_out { "timed_out" } else { "cancelled" });
+                child.0.cancel()?;
+                publish(tx, &task.task_id, stopped.unwrap());
+            }
+        }
+        if stopped.is_none() && !retry_watch.active() && last_output.elapsed() >= idle_timeout {
             stopped = Some(if cancel.load(Ordering::Relaxed) != 0 {
                 "cancelled"
             } else {
@@ -372,13 +459,18 @@ fn execute(
     if stopped.is_none() {
         input_result?;
     }
+    refresh_metrics(&mut outcome);
     let state = stopped.unwrap_or(if outcome.succeeded(exit_code) && process_error.is_none() {
         "succeeded"
     } else {
         "failed"
     });
     let mut report = json!({"task_id":task.task_id,"state":state,"exit_code":exit_code,"pid":pid,"duration_ms":start.elapsed().as_millis(),"outcome":outcome,"process_error":process_error});
-    if state == "timed_out" {
+    if retry_timed_out {
+        report["error_code"] = json!("retry_timeout");
+        report["error"] = json!(format!("上游异常后重试等待已达到 {} 秒，已终止任务进程树", task.retry_timeout_seconds));
+        report["upstream_error"] = json!(retry_watch.error);
+    } else if state == "timed_out" {
         report["error_code"] = json!("idle_timeout");
         report["error"] = json!(format!(
             "连续 {} 秒没有 CLI 输出，已终止任务进程树",
@@ -386,4 +478,47 @@ fn execute(
         ));
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod execution_contract_tests {
+    use super::*;
+    /// Claude 按快照隔离指令；关闭可恢复默认加载，Codex 参数保持原行为。
+    #[test]
+    fn clean_start_arguments_follow_task_snapshot() {
+        let mut task = crate::store::tests::sample("clean-args").task;
+        let profile = Profile { program: "cli".into(), model: None, effort: None };
+        for backend in [Backend::Claude, Backend::Codex, Backend::Opencode] {
+            task.backend = backend;
+            for resume in [None, Some("existing-session".to_owned())] {
+                task.resume_session = resume;
+                for enabled in [true, false] {
+                    task.clean_start = enabled;
+                    let args = arguments(&task, &profile);
+                    assert_eq!(args.iter().any(|arg| arg == "--safe-mode"),
+                        enabled && backend == Backend::Claude);
+                    assert!(!args.iter().any(|arg| arg == "project_doc_max_bytes=0"));
+                    assert_eq!(args.iter().any(|arg| arg == "existing-session"), task.resume_session.is_some());
+                    assert!(!args.iter().any(|arg| arg.contains("bypass") || arg == "--bare"));
+                }
+            }
+        }
+    }
+    /// 开放自测命令不改变只读任务白名单；stdin 完整保留原任务文本。
+    #[test]
+    fn self_test_tools_respect_edit_permission() {
+        let mut task = crate::store::tests::sample("self-test").task;
+        task.backend = Backend::Claude;
+        let profile = Profile { program: "claude".into(), model: None, effort: None };
+        for editable in [false, true] {
+            task.allow_edits = editable;
+            let args = arguments(&task, &profile);
+            for flag in ["--tools", "--allowedTools"] {
+                let index = args.iter().position(|arg| arg == flag).unwrap();
+                assert_eq!(args[index + 1].split(',').any(|tool| tool == "Bash"), editable);
+            }
+        }
+        let original = "不要运行工具\n只返回测试文本";
+        assert!(execution_prompt(original).ends_with(original));
+    }
 }

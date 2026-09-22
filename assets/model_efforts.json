@@ -1,23 +1,54 @@
 {
-  "verified_at": "2026-09-09",
+  "verified_at": "2026-09-14",
   "maintenance": "人工核对后更新本文件并重新构建。运行期间只读内嵌表，不联网、不通过刷新模型按钮更新强度。levels 记录当前 CLI 能使用的有效离散强度；思考开关、同义映射不伪装成额外强度。未知模型及 CLI 默认仅提供默认强度。",
   "sources": {
-    "codex_cli": "2026-09-09 本机已配置 Codex CLI app-server model/list 的 supportedReasoningEfforts 快照；非每次运行时查询",
+    "codex_cli": "2026-09-14 本机 Codex CLI app-server model/list 实际返回的 6 个模型及 supportedReasoningEfforts；仅本次维护查询，不在运行时刷新",
     "codex_protocol": "https://learn.chatgpt.com/docs/app-server#list-models-modellist",
     "luna": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
     "claude": "https://platform.claude.com/docs/en/build-with-claude/effort",
     "glm": "https://docs.z.ai/guides/capabilities/thinking",
     "deepseek": "https://api-docs.deepseek.com/guides/thinking_mode/",
+    "muse_13": "https://research.meta.ai/blog/introducing-muse-spark-1-3",
+    "muse_standard": "https://github.com/anomalyco/models.dev/blob/dev/providers/meta/models/muse-spark-1.3.toml",
+    "muse_contributor": "https://github.com/anomalyco/models.dev/blob/dev/providers/meta/models/muse-spark-1.3-contributor.toml",
+    "muse_contributor_user_test": "2026-09-14 用户反馈当前渠道发送 max 已收到回执，并明确要求开放该档位；未据此推断其他渠道或免费版能力",
+    "muse_12": "https://github.com/anomalyco/models.dev/blob/dev/providers/meta/models/muse-spark-1.2.toml",
+    "muse_11": "https://github.com/anomalyco/models.dev/blob/dev/providers/meta/models/muse-spark-1.1.toml",
+    "go_catalog": "https://github.com/anomalyco/models.dev/tree/dev/providers/opencode-go/models",
+    "grok": "https://docs.x.ai/developers/model-capabilities/text/reasoning",
+    "qwen": "https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-dashscope",
+    "minimax": "https://platform.minimax.io/docs/api-reference/text-openai-api",
+    "openai_astra": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+    "openai_sol": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+    "openai_terra": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
     "kimi_k3": "https://platform.kimi.ai/docs/guide/use-reasoning-effort",
     "kimi_k2": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
     "kimi_k27": "https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart"
   },
   "entries": [
     {
+      "models": ["muse-spark-1.3"],
+      "levels": ["low", "medium", "high", "xhigh", "max"],
+      "sources": ["muse_13", "muse_standard"],
+      "note": "标准版 1.3 支持 max；不将此能力扩展到 Contributor。API 另有 minimal，当前 CLI 离散强度表不展示该值。"
+    },
+    {
+      "models": ["muse-spark-1.3-contributor"],
+      "levels": ["low", "medium", "high", "xhigh", "max"],
+      "sources": ["muse_contributor", "muse_contributor_user_test"],
+      "note": "按用户当前渠道的 max 回执与明确要求开放 max；官方目录快照仍只列到 xhigh，实际采用的强度以供应商为准。"
+    },
+    {
+      "models": ["muse-spark-1.3-contributor-free", "muse-spark-1.2", "muse-spark-1.2-contributor", "muse-spark-1.1"],
+      "levels": ["low", "medium", "high", "xhigh"],
+      "sources": ["muse_contributor", "muse_12", "muse_11", "go_catalog"],
+      "note": "按官方目录快照收录到 xhigh，未将付费 Contributor 1.3 的用户反馈扩展到免费版或旧版本。API 另有 minimal，本 CLI 表不展示；默认不代表最高档。"
+    },
+    {
       "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"],
       "levels": ["low", "medium", "high", "xhigh", "max", "ultra"],
-      "sources": ["codex_cli", "codex_protocol"],
-      "note": "按本机 Codex CLI 能力快照维护，最高 ultra。"
+      "sources": ["codex_cli", "codex_protocol", "openai_astra", "openai_sol", "openai_terra"],
+      "note": "2026-09-14 Codex CLI 实测最高 ultra（自动任务委派）；官方直接 API 最高 max。ultra 是 Codex 能力，不保证 Claude CLI 或第三方网关支持。"
     },
     {
       "models": ["gpt-5.6-luna"],
@@ -77,19 +108,91 @@
       "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
       "levels": ["low", "high", "max"],
       "sources": ["deepseek"],
-      "note": "三档有效强度，默认 high；medium/xhigh 会被映射为 high，不重复展示。"
+      "note": "DeepSeek 官方 API 三档有效强度，默认 high；medium/xhigh 映射 high，ultra 映射 max。OpenCode Go 的 V4 Pro 目录仅声明 high/max，供应商限制需另行确认。"
     },
     {
       "models": ["kimi-k3"],
       "levels": ["low", "high", "max"],
       "sources": ["kimi_k3"],
-      "note": "Kimi K3 支持 low/high/max，默认 max。"
+      "note": "Kimi 官方 API 支持 low/high/max，默认 max；OpenCode Go 目录仅声明 max。此表记录厂商能力，不保证第三方供应商开放全部档位。"
     },
     {
       "models": ["kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2-thinking", "kimi-k2-thinking-turbo"],
       "levels": [],
       "sources": ["kimi_k2", "kimi_k27", "kimi_k3"],
       "note": "K2 系列资料未声明独立 effort 档位，保留默认；思考模式不等同于强度档位。"
+    },
+    {
+      "models": ["grok-4.6"],
+      "levels": ["low", "medium", "high", "xhigh"],
+      "sources": ["grok"],
+      "note": "Grok 4.6 四档有效强度，默认 high，最高 xhigh；不提供 max 或关闭思考。"
+    },
+    {
+      "models": ["grok-4.5"],
+      "levels": ["low", "medium", "high"],
+      "sources": ["grok"],
+      "note": "Grok 4.5 默认 high，xhigh 只映射为 high，不作为独立档位。"
+    },
+    {
+      "models": ["qwen3.8-max", "qwen3.8-max-0902", "qwen3.8-flash"],
+      "levels": ["low", "medium", "xhigh"],
+      "sources": ["qwen", "go_catalog"],
+      "note": "Qwen 3.8 三档有效强度，默认 xhigh；high/max 映射 xhigh，minimal 映射 low，none 属于思考开关。不得同时设置 reasoning_effort 与 thinking_budget。"
+    },
+    {
+      "models": ["qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus"],
+      "levels": [],
+      "sources": ["qwen", "go_catalog"],
+      "note": "官方目录仅声明思考开关和 token 预算，没有可直接透传的离散 effort 档位，保留默认。"
+    },
+    {
+      "models": ["deepseek-v4.1-flash"],
+      "levels": ["low", "high", "max"],
+      "sources": ["go_catalog", "qwen"],
+      "note": "按 OpenCode Go 目录提供 low/high/max；其他供应商可能使用 1–100 整数强度，不能据此推断通用 API 兼容性。"
+    },
+    {
+      "models": ["deepseek-v4-flash-vision-exp"],
+      "levels": ["low", "high", "max"],
+      "sources": ["go_catalog"],
+      "note": "OpenCode Go 的 V4 Flash Vision Exp 目录声明 low/high/max，思考开关单独控制。"
+    },
+    {
+      "models": ["hy3"],
+      "levels": ["low", "high"],
+      "sources": ["go_catalog"],
+      "note": "OpenCode Go 目录声明 low/high；none 是关闭思考，不列为离散强度。"
+    },
+    {
+      "models": ["hy4-preview"],
+      "levels": ["high"],
+      "sources": ["go_catalog"],
+      "note": "OpenCode Go 目录只声明 high 与关闭思考的 none；不补 low/max 等未声明值。"
+    },
+    {
+      "models": ["minimax-m3", "minimax-m2.7", "minimax-m2.5"],
+      "levels": [],
+      "sources": ["minimax", "go_catalog"],
+      "note": "M3 的 thinking 开关与 M2 系列推理不等于离散 effort；官方目录未声明独立强度，保留默认。"
+    },
+    {
+      "models": ["longcat-2.0", "mimo-v2.5", "mimo-v2.5-pro", "mimo-v2-pro", "mimo-v2-omni"],
+      "levels": [],
+      "sources": ["go_catalog"],
+      "note": "OpenCode 官方目录未声明离散 effort；LongCat 2.0 仅声明思考开关。保留默认，不假定 low/high/max 生效。"
+    },
+    {
+      "models": ["omen-alpha"],
+      "levels": ["low", "high"],
+      "sources": ["go_catalog"],
+      "note": "仅匹配 OpenCode 目录中的此明确 ID，支持 low/high；预览模型是否仍可调用以供应商列表为准。"
+    },
+    {
+      "models": ["ox-alpha-free"],
+      "levels": ["low", "high", "max"],
+      "sources": ["go_catalog"],
+      "note": "仅匹配 OpenCode 目录中的此明确 ID，支持 low/high/max；目录收录不保证免费活动或模型仍开放。"
     }
   ]
 }

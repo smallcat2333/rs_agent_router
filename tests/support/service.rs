@@ -109,6 +109,7 @@ fn local_service_health_lifecycle_and_evidence() {
         Manager::new(root.join("runs"), profiles, runner::now_ms() as i64).unwrap(),
     ));
     manager.lock().unwrap().routing.timeout_seconds = 30;
+    manager.lock().unwrap().max_parallel = 4;
     let sid = ipc::user_sid().unwrap();
     // 测试命名空间尚未创建；被动探活不得启动任何管理器。
     assert_eq!(ipc::probe(sid.clone(), None).unwrap(), 1);
@@ -231,6 +232,21 @@ fn local_service_health_lifecycle_and_evidence() {
         },
     );
 
+    // 异常重试超时独立于普通静默；不断报错/输出日志也不能续期，恢复内容则解除。
+    manager.lock().unwrap().routing.timeout_seconds = 30;
+    manager.lock().unwrap().routing.retry_timeout_seconds = 1;
+    for (id, expected) in [("retry_hang", "timed_out"), ("retry_recover", "succeeded")] {
+        let reply = exchange(&sid, Request::Submit { task: work(&root, id, id), wait: true });
+        assert_eq!(reply["state"], expected, "{reply}");
+        if id == "retry_hang" {
+            assert_eq!(reply["result"]["error_code"], "retry_timeout");
+            let elapsed = reply["result"]["duration_ms"].as_u64().unwrap();
+            assert!((1000..5000).contains(&elapsed));
+            let child: u32 = fs::read_to_string(root.join("retry_hang/child.pid")).unwrap().parse().unwrap();
+            assert_eq!(ipc::process_alive(child), Some(false));
+        }
+    }
+    manager.lock().unwrap().routing.retry_timeout_seconds = 60;
     manager.lock().unwrap().routing.timeout_seconds = 1;
     let timeout = exchange(
         &sid,
@@ -471,6 +487,72 @@ fn local_service_health_lifecycle_and_evidence() {
         Manager::new(root.join("runs"), Profiles::new(), runner::now_ms() as i64).unwrap();
     assert_eq!(restored.records["success"].reworks.len(), 1);
     assert_eq!(restored.records["success"].reviews.len(), 2);
+}
+
+/// 用真实测试进程验证默认三并发、FIFO、取消、动态限额和退出时清空排队。
+#[test]
+fn concurrency_queue_lifecycle() {
+    use std::os::windows::process::CommandExt;
+    let root = std::env::temp_dir().join(format!("router-queue-{}", runner::now_ms()));
+    fs::create_dir_all(&root).unwrap();
+    let fixture = root.join("fixture.exe");
+    let output = std::process::Command::new("rustc")
+        .args(["--edition", "2024"])
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixture_cli.rs"))
+        .arg("-o").arg(&fixture).creation_flags(0x08000000).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let profile = Profile { program: fixture, model: Some("fixture".into()), effort: Some("low".into()) };
+    let mut manager = Manager::new(root.join("runs"), [("claude".into(), profile)].into(), 0).unwrap();
+    manager.routing.timeout_seconds = 30;
+    assert_eq!(manager.max_parallel, 3);
+    for n in 1..=6 {
+        manager.submit(work(&root, &format!("q{n}"), "hang"), runner::now_ms() as i64).unwrap();
+    }
+    until(|| {
+        manager.poll(runner::now_ms() as i64).unwrap();
+        (1..=3).all(|n| root.join(format!("q{n}/child.pid")).exists())
+    });
+    assert_eq!(manager.running_count(), 3);
+    for n in 4..=6 {
+        let record = &manager.records[&format!("q{n}")];
+        assert_eq!(record.state, "queued");
+        assert!(!root.join(format!("q{n}/child.pid")).exists());
+        assert_eq!(record.turn_elapsed(runner::now_ms() as i64 + 600_000), 0);
+        assert!(!record.can_resume());
+        let compact = ipc::client_output(&json!({"type":"status","task":record}), true, false).unwrap();
+        assert_eq!(compact["state"], "queued");
+    }
+    // 取消等待者必须通知 --wait 客户端，且没有启动任何 CLI。
+    let (reply, received) = mpsc::sync_channel(8);
+    manager.request(ipc::Envelope { request: Request::Submit {
+        task: work(&root, "q7", "hang"), wait: true,
+    }, reply }, runner::now_ms() as i64);
+    manager.cancel("q7").unwrap();
+    assert_eq!(received.try_iter().last().unwrap()["state"], "cancelled");
+    assert!(!root.join("q7/child.pid").exists());
+    manager.cancel("q5").unwrap();
+    assert_eq!(manager.records["q5"].state, "cancelled");
+    manager.max_parallel = 1;
+    manager.cancel("q1").unwrap();
+    manager.cancel("q2").unwrap();
+    until(|| { manager.poll(runner::now_ms() as i64).unwrap(); manager.running_count() == 1 });
+    assert_eq!(manager.records["q4"].state, "queued");
+    manager.cancel("q3").unwrap();
+    until(|| { manager.poll(runner::now_ms() as i64).unwrap(); root.join("q4/child.pid").exists() });
+    assert_eq!(manager.records["q6"].state, "queued");
+    assert_eq!(manager.running_count(), 1);
+    manager.max_parallel = 2;
+    until(|| { manager.poll(runner::now_ms() as i64).unwrap(); root.join("q6/child.pid").exists() });
+    assert_eq!(manager.running_count(), 2);
+    manager.submit(work(&root, "q8", "hang"), runner::now_ms() as i64).unwrap();
+    manager.shutdown();
+    assert_eq!(manager.records["q8"].result["error_code"], "manager_shutdown");
+    assert_eq!(manager.records["q8"].result["duration_ms"], 0);
+    assert!(!root.join("q8/child.pid").exists());
+    until(|| { manager.poll(runner::now_ms() as i64).unwrap(); manager.running_count() == 0 });
+    drop(manager);
+    let restored = Manager::new(root.join("runs"), Profiles::new(), runner::now_ms() as i64).unwrap();
+    assert_eq!(restored.records["q8"].state, "cancelled");
 }
 
 /// 显式运行的真实 CLI 验证：读取用户配置快照，不改生产实例、认证或路由设置。

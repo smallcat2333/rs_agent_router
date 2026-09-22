@@ -1,5 +1,3 @@
-> 以下为独立发布前的历史验收记录。`%TEMP%` 下的证据仅存在于原开发环境，不随仓库分发；它们不代表本次发布或其他机器上的测试结果。当前可复现检查见 README 和 Windows CI。
-
 # 验证记录
 
 ## 2026-09-10 — Web 统计收口（验证于 2026-09-09）
@@ -35,7 +33,7 @@
 - 重复 show 返回同一管理器；之前另做 4 次 Debug/Release 并发 show，全部返回同一 PID。
 - 本机统计页面和 api/statistics 均返回 HTTP 200，schema_version=1，验收时包含 17 个历史会话。
 
-正式验收脚本：`%TEMP%/router-v06-final-check.ps1`。本轮没有使用 computer-use，也没有启动额外的预览管理器。
+正式验收脚本：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v06-final-check.ps1`。本轮没有使用 computer-use，也没有启动额外的预览管理器。
 
 ## 0.5.0 — 紧凑布局、即时设置与置顶悬浮窗
 
@@ -48,14 +46,14 @@
 - 关闭悬浮窗会复位主窗口开关；再次打开和通过开关关闭均通过；关闭预览没有影响真实管理器。
 - 合并托盘及模型归属修复后，26 项默认 Rust 测试通过，真实 CLI 用例保留为显式运行项；全目标 Clippy 与 Release 构建通过。
 
-交互证据：`%TEMP%/router-v5-preview-20260909-145259/ui-verification.json`。
+交互证据：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v5-preview-20260909-145259/ui-verification.json`。
 同目录 `preview.png` 为主页面原生渲染，`floating.png` 为悬浮窗原生渲染，内容均为离线样例。构建预览使用的临时插桩已恢复，不包含在正式程序中。
 
 ### 后续浮层优化
 
 由初版 500×700 改为宽 360、高度按任务数量 86/164/276/388；半透明、无系统标题栏，不占独立任务栏按钮，首帧绘制后显示且不抢焦点。模型信息移至标题提示，摘要收为单行，顶部拖动区与 × 关闭按钮分开命中。
 
-原生验证通过：实际非客户区无标题栏、TOPMOST、0/1/3 项动态高度、调整数量时保持同一窗口句柄、主窗隐藏后继续绘制、原生关闭及主窗开关联动。RGBA 渲染像素含透明和半透明值。证据：`%TEMP%/router-v5-overlay-20260909-150648/ui-verification.json`、同目录 `floating.png`。
+原生验证通过：实际非客户区无标题栏、TOPMOST、0/1/3 项动态高度、调整数量时保持同一窗口句柄、主窗隐藏后继续绘制、原生关闭及主窗开关联动。RGBA 渲染像素含透明和半透明值。证据：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v5-overlay-20260909-150648/ui-verification.json`、同目录 `floating.png`。
 
 右上角 × 用真实 egui 按下/释放事件验证点击返回关闭且不启动拖动；桌面鼠标注入未触发响应，不计作原生点击通过。浮层相关 UI 用例共 5 项通过，Clippy 全目标与 Release 编译通过。确认运行任务为零后正常重启，正式实例 PID 76680 沿用原配置和日志目录，health 正常；临时预览插桩全部恢复。
 
@@ -79,11 +77,11 @@
 
 Rust 默认测试 24 项通过；真实 CLI 测试另行显式运行通过（常规测试中标为 ignored，避免普通测试触发模型调用）。Clippy 全目标无警告，Debug 和 Release 编译通过。Release 先在 target/v04 独立构建，空闲后安装至标准 target/release；副本 SHA256 相同。两套 Skill 均通过 quick_validate；原有 argument-hint 参数说明移到正文，保留用法并满足校验规范。
 
-执行服务记录：`%TEMP%/router-v4-service-1788935221118/verification.json`。最后一轮还暂停测试管理泵，确认 health 在 3 秒后返回 health_check_timeout，已接收任务继续运行。
+执行服务记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v4-service-1788935221118/verification.json`。最后一轮还暂停测试管理泵，确认 health 在 3 秒后返回 health_check_timeout，已接收任务继续运行。
 
-真实 CLI 复验：`%TEMP%/router-v4-live-1788934949079/verification.json`。两个 CLI 都通过 Read 类工具读取输入，返回 42；GLM 上下文 4755、累计输入 9315，Codex 最新输入 18285、累计输入 35680，验证两种口径没有混用。以上数字仅为本次测试值。
+真实 CLI 复验：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v4-live-1788934949079/verification.json`。两个 CLI 都通过 Read 类工具读取输入，返回 42；GLM 上下文 4755、累计输入 9315，Codex 最新输入 18285、累计输入 35680，验证两种口径没有混用。以上数字仅为本次测试值。
 
-原生渲染证据：`%TEMP%/router-v4-preview-20260909-142405/preview.png`。预览为临时数据、禁用生产 IPC 的离线构建，源码已恢复；不是实际开发任务截图。Windows 桌面截图工具两次返回 `IGraphicsCaptureItemInterop.CreateForMonitor failed / 0x800706BE`，未把桌面截图或重新点击托盘/退出确认算作本次通过；这些桌面交互沿用 0.3 的记录。
+原生渲染证据：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v4-preview-20260909-142405/preview.png`。预览为临时数据、禁用生产 IPC 的离线构建，源码已恢复；不是实际开发任务截图。Windows 桌面截图工具两次返回 `IGraphicsCaptureItemInterop.CreateForMonitor failed / 0x800706BE`，未把桌面截图或重新点击托盘/退出确认算作本次通过；这些桌面交互沿用 0.3 的记录。
 
 ## 0.3.0 — CLI 执行服务
 
@@ -105,9 +103,9 @@ Rust 默认测试 24 项通过；真实 CLI 测试另行显式运行通过（常
 
 `cargo test --offline --bin rs_agent_router`：13 项通过。Clippy、Release 编译及 Skill 校验通过。
 
-服务回归记录：`%TEMP%/router-v3-fixture-20260909-121603/`。
+服务回归记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v3-fixture-20260909-121603/`。
 
-真实执行记录：`%TEMP%/router-v3-live-20260909-121727/verification.json`。
+真实执行记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v3-live-20260909-121727/verification.json`。
 
 当前桌面会话的右键/截图自动化不稳定；删除菜单采用确定性的 egui 事件测试，日志保留采用 SQLite/文件测试，不把桌面自动化失败当作成功。图标原图保留在 assets/app.png。
 
@@ -135,13 +133,13 @@ Skill 已固定三级语义：来源为发起 Harness，第二层 APP，第三�
 | GLM 真实 Write | succeeded，answer.txt 写入 42，原输入不变 |
 | Skill | UTF-8 模式 quick_validate.py 通过 |
 
-调试版集成记录：`%TEMP%/router-v2-fixture-20260909-104442/`。
+调试版集成记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v2-fixture-20260909-104442/`。
 
-Release 集成记录：`%TEMP%/router-v2-fixture-20260909-105313/`。
+Release 集成记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v2-fixture-20260909-105313/`。
 
-最终 Release 复验：`%TEMP%/router-v2-fixture-20260909-105822/`，配置与记录根目录包含中文和空格；首次提交、四任务、断开客户端、托盘、退出确认及所有失败用例通过。
+最终 Release 复验：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v2-fixture-20260909-105822/`，配置与记录根目录包含中文和空格；首次提交、四任务、断开客户端、托盘、退出确认及所有失败用例通过。
 
-真实调用记录：`%TEMP%/router-v2-live-20260909-104605/verification.json`。
+真实调用记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/router-v2-live-20260909-104605/verification.json`。
 
 首次自动启动测试发现管理进程继承 Harness 输出句柄，已改为 CreateProcessW 禁止句柄继承；退出状态重复拦截关闭事件也已修正，完整集成测试重跑通过。无障碍控件支持用于实际界面验证。
 
@@ -164,11 +162,11 @@ Release 集成记录：`%TEMP%/router-v2-fixture-20260909-105313/`。
 | 关闭已就绪的运行窗口 | cancelled，路由器退出 1，测试子进程已结束 |
 | CLI 路径不存在 | failed，路由器退出 1，保留 result.json |
 
-真实任务记录：`%TEMP%/rs-agent-router-20260909-093940/verification.json`。
+真实任务记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/rs-agent-router-20260909-093940/verification.json`。
 
-异常记录：`%TEMP%/rs-agent-router-failures-20260909-094418/verification.json`。
+异常记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/rs-agent-router-failures-20260909-094418/verification.json`。
 
-Release 复验记录：`%TEMP%/rs-agent-router-failures-20260909-094608/verification.json`，五类异常均通过。`cargo test --offline --bin rs_agent_router` 两项通过；`cargo clippy --offline --all-targets -- -D warnings` 通过；Release 编译通过。
+Release 复验记录：`C:/Users/kaizhong_liu/AppData/Local/Temp/rs-agent-router-failures-20260909-094608/verification.json`，五类异常均通过。`cargo test --offline --bin rs_agent_router` 两项通过；`cargo clippy --offline --all-targets -- -D warnings` 通过；Release 编译通过。
 
 首次取消测试在窗口消息循环就绪前发出关闭消息，未触发取消，最终由超时回收；测试已加入 WaitForInputIdle 后重跑通过。该轮运行占用调试版 exe 导致一次 cargo test 无法覆盖文件，待进程退出后重新验证。
 

@@ -29,9 +29,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// App 决定新任务的执行配置，Harness 只提供工作内容。
 #[derive(Serialize, Deserialize)]
 struct Preferences {
+    #[serde(default)]
+    dcr: crate::dcr::DcrConfig,
     backend: Backend,
     allow_edits: bool,
+    #[serde(default = "default_clean_start")]
+    clean_start: bool,
+    #[serde(default = "default_max_parallel")]
+    max_parallel: usize,
     timeout_seconds: u64,
+    #[serde(default = "crate::protocol::default_retry_timeout_seconds")]
+    retry_timeout_seconds: u64,
     #[serde(default = "default_archive_hours")]
     archive_hours: u64,
     #[serde(default)]
@@ -41,7 +49,21 @@ struct Preferences {
     #[serde(default = "default_floating_idle_minutes")]
     floating_idle_minutes: u64,
     #[serde(default)]
+    main_size: Option<[f32; 2]>,
+    #[serde(default)]
+    floating_bottom: Option<[f32; 2]>,
+    #[serde(default)]
     archived: bool,
+}
+
+/// 首次启动及已有设置新增该选项时，默认不自动加载用户和项目指令文件。
+fn default_clean_start() -> bool {
+    true
+}
+
+/// 首次启动及旧设置默认最多同时执行三个任务，其余按提交顺序排队。
+fn default_max_parallel() -> usize {
+    3
 }
 
 /// 尚未设置归档时间时保留四小时。
@@ -60,12 +82,18 @@ fn default_floating_idle_minutes() -> u64 {
 }
 
 /// 仅隐藏达到无活动期限的终态卡片；运行中保留，归档和删除仍由既有筛选处理。
+#[cfg(test)]
 fn floating_record_visible(record: &store::Record, now: i64, idle_minutes: u64) -> bool {
     record.running() || now.saturating_sub(record.last_activity) < (idle_minutes * 60_000) as i64
 }
 
 /// UI 编辑缓存与唯一管理器共享；无第二套执行状态机。
 struct Dashboard {
+    dcr: crate::dcr::DcrService,
+    dcr_open: bool,
+    dcr_error: String,
+    main_hwnd: usize,
+    floating_position: Arc<Mutex<FloatingPosition>>,
     floating: Arc<AtomicBool>,
     floating_ready: Arc<AtomicBool>,
     floating_native: Arc<Mutex<ui::OverlayWindow>>,
@@ -75,8 +103,9 @@ struct Dashboard {
     preferences: Preferences,
     editing_profiles: Profiles,
     model_choices: Vec<String>,
+    model_variants: std::collections::BTreeMap<String, Vec<String>>,
     model_backend: Backend,
-    model_refresh: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    model_refresh: Option<mpsc::Receiver<Result<crate::opencode::Catalog, String>>>,
     selected: Option<String>,
     detail_tab: u8,
     detail_content: String,
@@ -85,6 +114,13 @@ struct Dashboard {
     confirm_exit: bool,
     exit_request: Arc<AtomicBool>,
     _tray: TrayIcon,
+}
+
+/// 底边坐标在拖动和伸缩后记忆；重置中心请求由悬浮视口按实际尺寸消费。
+#[derive(Default)]
+struct FloatingPosition {
+    bottom: Option<[f32; 2]>,
+    reset_center: Option<egui::Pos2>,
 }
 
 /// 恢复窗口无需等待隐藏窗口的绘制事件，避免托盘恢复死锁。
@@ -109,6 +145,49 @@ fn tray_visibility(event: &TrayIconEvent, visible: bool, minimized: bool) -> Opt
 }
 
 impl Dashboard {
+    /// 顶部设置仅管理 DCR 服务，日志统一展示在主页面会话中。
+    fn dcr_window(&mut self, ctx: &egui::Context) {
+        if !self.dcr_open { return; }
+        let mut open = self.dcr_open;
+        let before = serde_json::to_value(&self.preferences.dcr).unwrap();
+        egui::Window::new("DCR · 网页端本机连接")
+            .open(&mut open).default_size([560., 180.]).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(self.dcr.status());
+                    if ui.add_enabled(!self.dcr.running(), egui::Button::new("启动")).clicked() {
+                        self.dcr_error = self.dcr.start(&self.preferences.dcr)
+                            .err().map(|e| format!("{e:#}")).unwrap_or_default();
+                    }
+                    if ui.add_enabled(self.dcr.running(), egui::Button::new("停止")).clicked() {
+                        self.dcr_error = self.dcr.stop()
+                            .err().map(|e| format!("{e:#}")).unwrap_or_default();
+                    }
+                    ui.checkbox(&mut self.preferences.dcr.auto_start, "随 AR 启动");
+                });
+                ui.add_enabled_ui(!self.dcr.running(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("出站代理");
+                        ui.text_edit_singleline(&mut self.preferences.dcr.proxy);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("工作目录");
+                        let mut workdir = self.preferences.dcr.workdir.to_string_lossy().into_owned();
+                        if ui.text_edit_singleline(&mut workdir).changed() {
+                            self.preferences.dcr.workdir = PathBuf::from(workdir);
+                        }
+                    });
+                });
+                if !self.dcr_error.is_empty() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, &self.dcr_error);
+                }
+            });
+        self.dcr_open = open;
+        if before != serde_json::to_value(&self.preferences.dcr).unwrap()
+            && let Err(e) = self.save_settings() {
+            self.dcr_error = format!("保存 DCR 设置失败：{e:#}");
+        }
+    }
+
     /// 独立置顶视口实时读取管理器；关闭它只关闭监控，不影响执行或主窗口。
     fn floating_window(&self, ctx: &egui::Context) {
         if !self.floating.load(Ordering::Relaxed) {
@@ -118,15 +197,15 @@ impl Dashboard {
         let enabled = self.floating.clone();
         let ready = self.floating_ready.clone();
         let native = self.floating_native.clone();
+        let logo = self.logo.clone();
+        let main_hwnd = self.main_hwnd;
+        let position = self.floating_position.clone();
         let manager = self.manager.clone();
+        let dcr_monitor = self.dcr.monitor();
         let limit = self.preferences.floating_limit;
         let idle_minutes = self.preferences.floating_idle_minutes;
         let backend = self.preferences.backend;
-        let cli = if backend == Backend::Claude {
-            "cc"
-        } else {
-            "cx"
-        };
+        let cli = backend.short();
         let model_label = self
             .editing_profiles
             .get(backend.key())
@@ -167,7 +246,10 @@ impl Dashboard {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                     return;
                 }
-                let styled = match native.lock().unwrap().apply(ctx.pixels_per_point()) {
+                let passthrough = unsafe {
+                    IsWindowVisible(main_hwnd as _) == 0 || IsIconic(main_hwnd as _) != 0
+                };
+                let styled = match native.lock().unwrap().apply(ctx.pixels_per_point(), passthrough) {
                     Ok(styled) => styled,
                     Err(error) => {
                         manager.lock().unwrap().error = format!("悬浮窗原生样式失败：{error}");
@@ -178,29 +260,43 @@ impl Dashboard {
                         return;
                     }
                 };
-                let (running, records) = {
+                let now = runner::now_ms() as i64;
+                let (running, router_records, archive_hours) = {
                     let manager = manager.lock().unwrap();
-                    (
-                        manager.running_count(),
-                        store::recent_with_limit(
-                            manager.records.values()
-                                .filter(|record| floating_record_visible(record, runner::now_ms() as i64, idle_minutes))
-                                .cloned(),
-                            limit,
-                        ),
-                    )
+                    (manager.running_count(), manager.records.values().cloned().collect::<Vec<_>>(), manager.archive_hours)
                 };
+                let dcr = {
+                    let mut session = dcr_monitor.lock().unwrap();
+                    session.update_window(now, archive_hours);
+                    session.clone()
+                };
+                let records = crate::dcr_view::recent(&router_records, &dcr, limit, now,
+                    Some((idle_minutes * 60_000) as i64));
                 let size = ui::floating_size(
                     records.len(),
                     ctx.input(|input| input.viewport().monitor_size.map(|size| size.y)),
                 );
-                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect)
-                    .filter(|rect| (rect.size() - size).abs().max_elem() > 1.)
-                {
-                    ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::OuterPosition(
-                        egui::pos2(rect.left(), rect.bottom() - size.y),
-                    ));
-                    ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::InnerSize(size));
+                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                    let mut position = position.lock().unwrap();
+                    let resized = (rect.size() - size).abs().max_elem() > 1.;
+                    let target = if let Some(center) = position.reset_center.take() {
+                        Some(center - size / 2.)
+                    } else if !ready.load(Ordering::Relaxed) && position.bottom.is_some() {
+                        position.bottom.map(|[x, bottom]| egui::pos2(x, bottom - size.y))
+                    } else if resized {
+                        Some(egui::pos2(rect.left(), rect.bottom() - size.y))
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        position.bottom = Some([target.x, target.y + size.y]);
+                        ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::OuterPosition(target));
+                    } else {
+                        position.bottom = Some([rect.left(), rect.bottom()]);
+                    }
+                    if resized {
+                        ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::InnerSize(size));
+                    }
                 }
                 egui::CentralPanel::default()
                     .frame(
@@ -214,15 +310,22 @@ impl Dashboard {
                             .inner_margin(egui::Margin::same(8)),
                     )
                     .show(ctx, |ui| {
-                        let (close, drag, clear) = ui::floating_header(ui, running, &model_label);
+                        // 穿透由原生窗口处理；仅拦截残留操作，不用禁用样式改变亮度。
+                        ui.style_mut().interaction.selectable_labels = false;
+                        let (close, drag, clear) = ui::floating_header(ui, running + usize::from(dcr.busy()), &model_label, logo.id());
+                        let areas = ctx.data(|data| data.get_temp::<[egui::Rect; 2]>(egui::Id::new("floating_button_rects"))).unwrap();
+                        native.lock().unwrap().button_hit_regions(passthrough, areas, ctx.pixels_per_point());
                         if clear {
+                            let mut session = dcr_monitor.lock().unwrap();
+                            if !session.busy() { session.hide(); }
+                            drop(session);
                             let mut manager = manager.lock().unwrap();
                             if let Err(error) = clear_finished(&mut manager) {
                                 manager.error = error.to_string();
                             }
                             ctx.request_repaint_of(egui::ViewportId::ROOT);
                         }
-                        if drag {
+                        if drag && !passthrough {
                             ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::StartDrag);
                         }
                         if close {
@@ -242,7 +345,10 @@ impl Dashboard {
                                     ui.label("等待任务");
                                 }
                                 for record in &records {
-                                    ui::floating_summary(ui, record, runner::now_ms() as i64);
+                                    match record {
+                                        crate::dcr_view::Card::Router(record) => ui::floating_summary(ui, record, now),
+                                        crate::dcr_view::Card::Dcr(session) => crate::dcr_view::floating(ui, session, now),
+                                    }
                                 }
                             });
                     });
@@ -271,10 +377,13 @@ impl Dashboard {
         )?;
         manager.profiles = self.editing_profiles.clone();
         manager.archive_hours = self.preferences.archive_hours;
+        manager.max_parallel = self.preferences.max_parallel;
         manager.routing = Routing {
             backend: self.preferences.backend,
             allow_edits: self.preferences.allow_edits,
+            clean_start: self.preferences.clean_start,
             timeout_seconds: self.preferences.timeout_seconds,
+            retry_timeout_seconds: self.preferences.retry_timeout_seconds,
         };
         Ok(())
     }
@@ -282,6 +391,7 @@ impl Dashboard {
     fn refresh_models(&mut self) {
         self.model_backend = self.preferences.backend;
         self.model_choices.clear();
+        self.model_variants.clear();
         let Some(profile) = self.editing_profiles.get(self.model_backend.key()) else {
             self.error = "请先配置 CLI 路径".into();
             return;
@@ -292,7 +402,12 @@ impl Dashboard {
         self.model_refresh = Some(rx);
         std::thread::spawn(move || {
             let _ = tx.send(
-                crate::model_catalog::discover(backend, &program)
+                (if backend == Backend::Opencode {
+                    crate::opencode::catalog(&program)
+                } else {
+                    crate::model_catalog::discover(backend, &program).map(|models|
+                        crate::opencode::Catalog { models, ..Default::default() })
+                })
                     .map_err(|error| format!("模型刷新失败：{error:#}")),
             );
         });
@@ -360,7 +475,27 @@ impl eframe::App for Dashboard {
     }
     /// 每帧只展示快照；所有活动更新来自后台调度，不随排序或选择改变。
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.dcr.poll();
+        self.dcr_window(ctx);
         let now = runner::now_ms() as i64;
+        let old_geometry = (self.preferences.main_size, self.preferences.floating_bottom);
+        ctx.input(|input| {
+            let viewport = input.viewport();
+            if viewport.minimized != Some(true) && viewport.maximized != Some(true)
+                && let Some(rect) = viewport.inner_rect
+                && rect.width() >= 1000. && rect.height() >= 650.
+            {
+                self.preferences.main_size = Some([rect.width(), rect.height()]);
+            }
+        });
+        self.preferences.floating_bottom = self.floating_position.lock().unwrap().bottom;
+        if old_geometry != (self.preferences.main_size, self.preferences.floating_bottom) {
+            let root = self.manager.lock().unwrap().root.clone();
+            if let Err(error) = std::fs::write(root.join("preferences.json"),
+                serde_json::to_vec_pretty(&self.preferences).unwrap()) {
+                self.error = format!("窗口位置保存失败：{error}");
+            }
+        }
         if let Some(result) = self
             .model_refresh
             .as_ref()
@@ -369,7 +504,8 @@ impl eframe::App for Dashboard {
             self.model_refresh = None;
             match result {
                 Ok(models) => {
-                    self.model_choices = models;
+                    self.model_choices = models.models;
+                    self.model_variants = models.variants;
                     self.error.clear();
                 }
                 Err(error) => self.error = error,
@@ -382,6 +518,12 @@ impl eframe::App for Dashboard {
                 self.selected = None;
             }
         }
+        let dcr = {
+            let monitor = self.dcr.monitor();
+            let mut session = monitor.lock().unwrap();
+            session.update_window(now, self.preferences.archive_hours);
+            session.clone()
+        };
         let mut actions = Vec::new();
         let mut refresh_models = false;
         let mut test_model = false;
@@ -399,7 +541,7 @@ impl eframe::App for Dashboard {
                 || self.exit_request.swap(false, Ordering::Relaxed))
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if running > 0 {
+            if running > 0 || dcr.busy() {
                 self.confirm_exit = true;
             } else {
                 self.manager.lock().unwrap().shutdown();
@@ -427,7 +569,11 @@ impl eframe::App for Dashboard {
                             .size(12.)
                             .color(ui::MUTED),
                     );
-                    ui::badge(ui, &format!("{running} 运行"), ui::ACCENT);
+                    ui::badge(ui, &format!("{} 运行", running + usize::from(dcr.busy())), ui::ACCENT);
+                    let queued = records.iter().filter(|record| record.state == "queued").count();
+                    if queued > 0 {
+                        ui::badge(ui, &format!("{queued} 排队"), ui::state_color("queued"));
+                    }
                     ui.add_space(8.);
                     ui::legend(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -447,7 +593,7 @@ impl eframe::App for Dashboard {
                         ui.checkbox(&mut self.archived, "显示归档");
                         if ui
                             .add_enabled(
-                                records.iter().any(|r| !r.running() && !r.deleted),
+                                records.iter().any(|r| !r.running() && !r.deleted) || (dcr.visible && !dcr.busy()),
                                 egui::Button::new("清空已结束"),
                             )
                             .on_hover_text("清空所有已结束任务（含归档），保留运行任务和磁盘日志")
@@ -455,6 +601,7 @@ impl eframe::App for Dashboard {
                         {
                             actions.push(ui::Action::ClearFinished);
                         }
+                        ui.separator();
                         let mut floating = self.floating.load(Ordering::Relaxed);
                         if ui.checkbox(&mut floating, "悬浮窗").changed() {
                             self.floating_ready.store(false, Ordering::Relaxed);
@@ -469,6 +616,11 @@ impl eframe::App for Dashboard {
                             .range(1..=10080))
                             .on_hover_text("运行中的任务不受无活动隐藏限制；修改后自动记忆");
                         ui.label("无活动隐藏");
+                        if ui.button("悬浮位置重置").clicked() {
+                            self.floating_position.lock().unwrap().reset_center =
+                                ctx.input(|input| input.viewport().outer_rect.map(|rect| rect.center()));
+                            self.floating.store(true, Ordering::Relaxed);
+                        }
                     });
                 });
                 ui.add_space(3.);
@@ -492,13 +644,15 @@ impl eframe::App for Dashboard {
                                 Backend::Codex,
                                 "Codex",
                             );
-                            let key = match self.preferences.backend {
-                                Backend::Claude => "claude",
-                                Backend::Codex => "codex",
-                            };
+                            ui.selectable_value(&mut self.preferences.backend, Backend::Opencode, "OpenCode");
+                            let key = self.preferences.backend.key();
                             let profile =
                                 self.editing_profiles.entry(key.into()).or_insert(Profile {
-                                    program: PathBuf::new(),
+                                    program: if self.preferences.backend == Backend::Opencode {
+                                        std::env::var_os("APPDATA").map(PathBuf::from)
+                                            .map(|path| path.join("npm/node_modules/opencode-ai/bin/opencode.exe"))
+                                            .filter(|path| path.is_file()).unwrap_or_else(|| "opencode".into())
+                                    } else { PathBuf::new() },
                                     model: None,
                                     effort: None,
                                 });
@@ -513,21 +667,10 @@ impl eframe::App for Dashboard {
                             }
                             ui.add_space(8.);
                             ui.label("模型");
-                            egui::ComboBox::from_id_salt("model")
-                                .width(160.)
-                                .selected_text(profile.model.as_deref().unwrap_or("CLI 默认"))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut profile.model, None, "CLI 默认");
-                                    if self.model_backend == self.preferences.backend {
-                                        for model in &self.model_choices {
-                                            ui.selectable_value(
-                                                &mut profile.model,
-                                                Some(model.clone()),
-                                                model,
-                                            );
-                                        }
-                                    }
-                                });
+                            ui::model_picker(ui, &mut profile.model,
+                                if self.model_backend == self.preferences.backend {
+                                    &self.model_choices
+                                } else { &[] });
                             refresh_models = ui
                                 .add_enabled(
                                     self.model_refresh.is_none(),
@@ -537,50 +680,103 @@ impl eframe::App for Dashboard {
                                         "刷新"
                                     }),
                                 )
-                                .on_hover_text("Claude 重读 CC Switch；Codex 查询 CLI 可选模型列表")
+                                .on_hover_text("Claude 重读 CC Switch；Codex / OpenCode 查询各自 CLI 的可选模型列表")
                                 .clicked();
                             test_model = ui
                                 .add_enabled(!shutting, egui::Button::new("测试"))
                                 .on_hover_text("用所选配置提交一次模型测试任务")
                                 .clicked();
                             ui.add_space(8.);
-                            crate::model_efforts::normalize(
-                                profile.model.as_deref(),
-                                &mut profile.effort,
-                            );
+                            if self.preferences.backend != Backend::Opencode {
+                                crate::model_efforts::normalize(profile.model.as_deref(), &mut profile.effort);
+                            } else if self.model_backend == Backend::Opencode && self.model_refresh.is_none()
+                                && profile.effort.as_ref().is_some_and(|effort| !profile.model.as_ref()
+                                    .and_then(|model| self.model_variants.get(model)).is_some_and(|levels| levels.contains(effort))) {
+                                profile.effort = None;
+                            }
                             let effort_rule =
                                 crate::model_efforts::lookup(profile.model.as_deref());
-                            egui::ComboBox::from_id_salt("effort")
-                                .selected_text(format!(
-                                    "强度 {}",
-                                    profile.effort.as_deref().unwrap_or("默认")
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut profile.effort, None, "默认");
-                                    let levels = effort_rule
-                                        .map(|rule| rule.levels.as_slice())
-                                        .unwrap_or(&[]);
-                                    for level in levels {
-                                        ui.selectable_value(
-                                            &mut profile.effort,
-                                            Some(level.clone()),
-                                            level,
-                                        );
-                                    }
-                                })
-                                .response
-                                .on_hover_text(
-                                    effort_rule.map(|rule| rule.note.as_str()).unwrap_or(
+                            let effort_label = format!(
+                                "强度 {}", profile.effort.as_deref().unwrap_or("默认")
+                            );
+                            let effort_font = egui::TextStyle::Button.resolve(ui.style());
+                            let label_size = ui.painter().layout_no_wrap(
+                                effort_label.clone(), effort_font.clone(), ui.visuals().text_color()
+                            ).size();
+                            let effort_button = ui.add_sized(
+                                [label_size.x + 36., 24.], egui::Button::new("")
+                            );
+                            let effort_color = ui.style().interact(&effort_button).text_color();
+                            ui.painter().text(
+                                effort_button.rect.left_center() + egui::vec2(6., 0.),
+                                egui::Align2::LEFT_CENTER, effort_label, effort_font, effort_color,
+                            );
+                            // 与模型菜单一致，绘制几何三角形，避免字体缺字显示方框。
+                            let arrow_center = egui::pos2(
+                                effort_button.rect.right() - 12., effort_button.rect.center().y
+                            );
+                            ui.painter().add(egui::Shape::convex_polygon(
+                                vec![arrow_center + egui::vec2(-4., -2.),
+                                     arrow_center + egui::vec2(4., -2.),
+                                     arrow_center + egui::vec2(0., 3.)],
+                                effort_color, egui::Stroke::NONE,
+                            ));
+                            let effort_popup = ui.make_persistent_id("effort_popup");
+                            if effort_button.clicked() {
+                                ui.memory_mut(|memory| memory.toggle_popup(effort_popup));
+                            }
+                            egui::popup::popup_below_widget(
+                                ui, effort_popup, &effort_button,
+                                egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                                    let levels = if self.preferences.backend == Backend::Opencode {
+                                        profile.model.as_ref().and_then(|model| self.model_variants.get(model))
+                                            .map(Vec::as_slice).unwrap_or(&[])
+                                    } else { effort_rule.map(|rule| rule.levels.as_slice()).unwrap_or(&[]) };
+                                    // 在滚动区外设置弹层高度，支持同时显示十行选项。
+                                    let row_height = 26.;
+                                    let height = (levels.len() + 1).min(10) as f32
+                                        * (row_height + ui.spacing().item_spacing.y);
+                                    ui.set_height(height);
+                                    egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                                        ui.spacing_mut().interact_size.y = row_height;
+                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                                        ui.selectable_value(&mut profile.effort, None, "默认");
+                                        for level in levels {
+                                            ui.selectable_value(
+                                                &mut profile.effort,
+                                                Some(level.clone()),
+                                                level,
+                                            );
+                                        }
+                                    });
+                                });
+                            effort_button.on_hover_text(
+                                    if self.preferences.backend == Backend::Opencode { "档位取 OpenCode 模型的原生 variant；未声明时使用默认。" } else { effort_rule.map(|rule| rule.note.as_str()).unwrap_or(
                                         if profile.model.is_none() {
                                             "请先指定模型，再选择其支持的强度。"
                                         } else {
                                             "本地表尚未收录该模型，使用默认强度。"
                                         },
-                                    ),
+                                    ) },
                                 );
-                            ui.add_space(10.);
+                        });
+                    });
+                ui.add_space(3.);
+                egui::ScrollArea::horizontal()
+                    .id_salt("execution_configuration_strip")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.set_height(26.);
+                            ui.spacing_mut().interact_size.y = 24.;
+                            ui.spacing_mut().item_spacing.x = 8.;
                             ui.checkbox(&mut self.preferences.allow_edits, "允许修改文件");
                             ui.add_space(8.);
+                            if self.preferences.backend == Backend::Claude {
+                                ui.checkbox(&mut self.preferences.clean_start, "纯净启动")
+                                    .on_hover_text("新会话不自动加载用户和项目的 CLAUDE.md、技能及插件等定制；已有会话沿用创建时设置。");
+                                ui.add_space(8.);
+                            }
                             let timeout_label = ui.label("无输出超时");
                             ui.add(
                                 egui::DragValue::new(&mut self.preferences.timeout_seconds)
@@ -589,12 +785,29 @@ impl eframe::App for Dashboard {
                             .labelled_by(timeout_label.id)
                             .on_hover_text("从启动或最近一次 CLI 非空输出开始计时；标准输出和错误日志均会重置，持续输出不限制任务总时长。");
                             ui.label("秒");
+                            if self.preferences.backend == Backend::Claude {
+                                ui.label("异常重试");
+                                ui.add_sized([48., 24.], egui::DragValue::new(
+                                    &mut self.preferences.retry_timeout_seconds).range(1..=86400))
+                                    .on_hover_text("首次上游异常后允许 CLI 重试的总等待时间；重复报错不延长，恢复正常模型输出后解除，到期按超时终止。");
+                                ui.label("秒");
+                            }
                             ui.label("归档");
                             ui.add(
                                 egui::DragValue::new(&mut self.preferences.archive_hours)
                                     .range(1..=8760),
                             );
                             ui.label("h");
+                            ui.add_space(8.);
+                            ui.label("并行");
+                            ui.add_sized([48., 24.],
+                                egui::DragValue::new(&mut self.preferences.max_parallel).range(1..=100))
+                                .on_hover_text("最大同时执行数量，默认 3；超出上限按提交顺序排队，降低上限不会中断运行任务。");
+                            ui.separator();
+                            if ui.button("DCR 设置").clicked() {
+                                self.dcr_open = true;
+                            }
+                            ui.label(self.dcr.status());
                         });
                     });
                 self.preferences.floating = self.floating.load(Ordering::Relaxed);
@@ -652,16 +865,9 @@ impl eframe::App for Dashboard {
                         .iter()
                         .filter(|r| r.archived == self.archived && !r.deleted)
                         .collect();
-                    ui::tree(
-                        ui,
-                        &visible,
-                        0,
-                        "groups",
-                        &mut self.selected,
-                        now,
-                        &mut actions,
-                    );
-                    if visible.is_empty() {
+                    crate::dcr_view::tree(ui, &visible, &dcr, self.archived,
+                        &mut self.selected, now, &mut actions);
+                    if visible.is_empty() && !(dcr.visible && dcr.archived == self.archived) {
                         ui.label("暂无任务");
                     }
                 });
@@ -670,7 +876,8 @@ impl eframe::App for Dashboard {
             self.detail_tab = 2;
             self.load_detail();
         }
-        let recent = store::recent(records.into_iter());
+        let router_recent = store::recent(records.clone().into_iter());
+        let recent = crate::dcr_view::recent(&router_recent, &dcr, 3, now, None);
         egui::CentralPanel::default().show(ctx, |ui| {
             if recent.is_empty() {
                 ui.centered_and_justified(|ui| ui.label("等待 Harness 下发工作"));
@@ -686,14 +893,28 @@ impl eframe::App for Dashboard {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                     ui.set_min_size(rect.size());
                     ui.set_max_size(rect.size());
-                    if let Some(action) = ui::execution(ui, record, now) {
-                        actions.push(action);
+                    match record {
+                        crate::dcr_view::Card::Router(record) => {
+                            if let Some(action) = ui::execution(ui, record, now) { actions.push(action); }
+                        }
+                        crate::dcr_view::Card::Dcr(session) => crate::dcr_view::execution(
+                            ui, session, now, &mut self.selected, &mut actions),
                     }
                 });
             }
             ui.allocate_rect(area, egui::Sense::hover());
         });
-        if self.selected.is_some() {
+        if self.selected.as_deref() == Some(crate::dcr_view::DCR_ID) {
+            let mut open = true;
+            egui::Window::new("DCR 调用 · 会话详情").open(&mut open)
+                .default_size([750., 550.]).show(ctx, |ui| {
+                    ui.label(format!("{} · {} 个执行中调用", dcr.state_label(), dcr.active_tools.len()));
+                    ui.label(egui::RichText::new(crate::dcr_view::timing(&dcr, now)).size(12.).color(ui::MUTED));
+                    ui.small("所有网页端调用汇总于此；工具返回不代表其启动的后台进程已结束。");
+                    crate::dcr_view::logs(ui, &dcr, "dcr_detail_logs", true);
+                });
+            if !open { self.selected = None; }
+        } else if self.selected.is_some() {
             let mut open = true;
             egui::Window::new("任务详情")
                 .open(&mut open)
@@ -748,7 +969,7 @@ impl eframe::App for Dashboard {
                 .anchor(egui::Align2::CENTER_CENTER, [0., 0.])
                 .show(ctx, |ui| {
                     ui.label(format!(
-                        "当前存在 {running} 个运行任务。退出将终止全部任务，并向 Harness 返回错误。"
+                        "当前存在 {running} 个 CLI 任务，{} 个 DCR 调用。退出将终止运行中的工作。", dcr.active_tools.len()
                     ));
                     ui.horizontal(|ui| {
                         if ui.button("继续运行").clicked() {
@@ -762,6 +983,32 @@ impl eframe::App for Dashboard {
                 });
         }
         for action in actions {
+            match &action {
+                ui::Action::Archive(id, archived) if id == crate::dcr_view::DCR_ID => {
+                    let monitor = self.dcr.monitor();
+                    let mut session = monitor.lock().unwrap();
+                    if !session.busy() { session.set_archived(*archived); }
+                    continue;
+                }
+                ui::Action::Delete(id) if id == crate::dcr_view::DCR_ID => {
+                    let monitor = self.dcr.monitor();
+                    let mut session = monitor.lock().unwrap();
+                    if !session.busy() {
+                        session.hide();
+                        if self.selected.as_deref() == Some(crate::dcr_view::DCR_ID) { self.selected = None; }
+                    }
+                    continue;
+                }
+                ui::Action::ClearFinished => {
+                    let monitor = self.dcr.monitor();
+                    let mut session = monitor.lock().unwrap();
+                    if !session.busy() {
+                        session.hide();
+                        if self.selected.as_deref() == Some(crate::dcr_view::DCR_ID) { self.selected = None; }
+                    }
+                }
+                _ => {}
+            }
             let mut manager = self.manager.lock().unwrap();
             let result = match action {
                 ui::Action::ClearFinished => {
@@ -830,13 +1077,19 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
             serde_json::from_value(value)?
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Preferences {
+            dcr: Default::default(),
             backend: Backend::Claude,
             allow_edits: false,
+            clean_start: default_clean_start(),
+            max_parallel: default_max_parallel(),
             timeout_seconds: 300,
+            retry_timeout_seconds: crate::protocol::default_retry_timeout_seconds(),
             archive_hours: 4,
             floating: false,
             floating_limit: default_floating_limit(),
             floating_idle_minutes: default_floating_idle_minutes(),
+            main_size: None,
+            floating_bottom: None,
             archived: false,
         },
         Err(e) => return Err(e.into()),
@@ -846,17 +1099,20 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
             profiles.insert("claude".into(), profile);
         }
     }
-    profiles.retain(|key, _| key == "claude" || key == "codex");
+    profiles.retain(|key, _| key == "claude" || key == "codex" || key == "opencode");
     let manager = Arc::new(Mutex::new(Manager::new_with_archive(
         root,
         profiles.clone(),
         runner::now_ms() as i64,
         preferences.archive_hours,
     )?));
+    manager.lock().unwrap().max_parallel = preferences.max_parallel;
     manager.lock().unwrap().routing = Routing {
         backend: preferences.backend,
         allow_edits: preferences.allow_edits,
+        clean_start: preferences.clean_start,
         timeout_seconds: preferences.timeout_seconds,
+        retry_timeout_seconds: preferences.retry_timeout_seconds,
     };
     let (tx, rx) = mpsc::channel();
     let statistics = crate::webstats::WebStats::start(tx.clone())?;
@@ -872,7 +1128,7 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!(
                 "../assets/window.png"
             ))?)
-            .with_inner_size([1440., 900.])
+            .with_inner_size(preferences.main_size.unwrap_or([1440., 900.]))
             .with_transparent(true)
             .with_min_inner_size([1000., 650.]),
         ..Default::default()
@@ -968,6 +1224,14 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
                 }
             }));
             let mut dashboard = Dashboard {
+                dcr: crate::dcr::DcrService::new(),
+                dcr_open: false,
+                dcr_error: String::new(),
+                main_hwnd: hwnd,
+                floating_position: Arc::new(Mutex::new(FloatingPosition {
+                    bottom: preferences.floating_bottom,
+                    reset_center: None,
+                })),
                 floating: Arc::new(AtomicBool::new(preferences.floating)),
                 floating_ready: Arc::new(AtomicBool::new(false)),
                 floating_native: Arc::new(Mutex::new(ui::OverlayWindow::default())),
@@ -976,6 +1240,7 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
                 config,
                 model_backend: preferences.backend,
                 model_choices: Vec::new(),
+                model_variants: Default::default(),
                 model_refresh: None,
                 archived: preferences.archived,
                 preferences,
@@ -988,7 +1253,17 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
                 exit_request,
                 _tray: tray,
             };
+            let monitor_path = dashboard.manager.lock().unwrap().root.join("dcr-session.json");
+            let history_path = PathBuf::from(std::env::var_os("USERPROFILE")
+                .ok_or_else(|| anyhow::anyhow!("缺少 USERPROFILE，无法定位 DCR 历史"))?)
+                .join(".claude-server-commander/tool-history.jsonl");
+            dashboard.dcr.configure_monitor(monitor_path, history_path)?;
             dashboard.refresh_models();
+            if dashboard.preferences.dcr.auto_start
+                && let Err(error) = dashboard.dcr.start(&dashboard.preferences.dcr) {
+                dashboard.dcr_error = format!("DCR 自动启动失败：{error:#}");
+                dashboard.dcr_open = true;
+            }
             Ok(Box::new(dashboard))
         }),
     );
@@ -1024,25 +1299,47 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(old.archive_hours, 4);
+        assert!(old.clean_start);
+        assert_eq!(old.max_parallel, 3);
+        assert!(!old.dcr.auto_start);
+        assert_eq!(old.retry_timeout_seconds, 60);
         assert_eq!(old.floating_limit, 4);
         assert_eq!(old.floating_idle_minutes, 30);
         let settings = Preferences {
+            dcr: crate::dcr::DcrConfig {
+                auto_start: true,
+                proxy: "http://127.0.0.1:11809".into(),
+                workdir: PathBuf::from("C:/workspace"),
+            },
             backend: Backend::Codex,
             allow_edits: true,
+            clean_start: false,
+            max_parallel: 5,
             timeout_seconds: 600,
+            retry_timeout_seconds: 75,
             archive_hours: 6,
             floating: true,
             floating_limit: 7,
             floating_idle_minutes: 45,
+            main_size: Some([1280., 800.]),
+            floating_bottom: Some([100., 900.]),
             archived: true,
         };
         let restored: Preferences =
             serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
         assert_eq!(restored.backend, Backend::Codex);
+        assert!(restored.dcr.auto_start);
+        assert_eq!(restored.dcr.proxy, settings.dcr.proxy);
+        assert_eq!(restored.dcr.workdir, settings.dcr.workdir);
+        assert!(!restored.clean_start);
+        assert_eq!(restored.max_parallel, 5);
+        assert_eq!(restored.retry_timeout_seconds, 75);
         assert_eq!((restored.timeout_seconds, restored.archive_hours), (600, 6));
         assert!(restored.allow_edits && restored.floating && restored.archived);
         assert_eq!(restored.floating_limit, 7);
         assert_eq!(restored.floating_idle_minutes, 45);
+        assert_eq!(restored.main_size, Some([1280., 800.]));
+        assert_eq!(restored.floating_bottom, Some([100., 900.]));
     }
     /// 清空终态与归档记录，但不删除执行中的任务或任何日志文件。
     #[test]

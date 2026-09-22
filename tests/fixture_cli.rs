@@ -12,7 +12,35 @@ fn main() {
     }
     let mut prompt = String::new();
     io::stdin().read_to_string(&mut prompt).unwrap();
-    if matches!(
+    // 跳过服务统一附加的执行约束，只解释原始测试指令。
+    let prompt = prompt.split_once("--- Router 任务正文 ---\n")
+        .map_or(prompt.as_str(), |(_, task)| task).to_owned();
+    if matches!(prompt.as_str(), "retry_hang" | "retry_recover") {
+        use std::os::windows::process::CommandExt;
+        let args: Vec<_> = std::env::args().collect();
+        let index = args.iter().position(|arg| arg == "--debug-file").unwrap();
+        let mut debug = std::fs::File::create(&args[index + 1]).unwrap();
+        writeln!(debug, "2026-09-15T08:34:29.092Z [ERROR] API error (attempt 1/11): 500 fixture").unwrap();
+        debug.flush().unwrap();
+        if prompt == "retry_hang" {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--fixture-child").creation_flags(0x08000000).spawn().unwrap();
+            std::fs::write("child.pid", child.id().to_string()).unwrap();
+            for n in 2..30 {
+                std::thread::sleep(Duration::from_millis(200));
+                writeln!(debug, "2026-09-15T08:34:29.092Z [ERROR] API error (attempt {n}/30): 500 fixture").unwrap();
+                debug.flush().unwrap();
+                eprintln!("retrying request");
+            }
+            child.wait().unwrap();
+        } else {
+            std::thread::sleep(Duration::from_millis(400));
+            println!("{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"recovered\"}}]}}}}");
+            io::stdout().flush().unwrap();
+            std::thread::sleep(Duration::from_millis(1400));
+            println!("{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}");
+        }
+    } else if matches!(
         prompt.as_str(),
         "active" | "stderr_active" | "active_then_silent" | "silent"
     ) {

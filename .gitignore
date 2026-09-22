@@ -1,20 +1,3 @@
 /target/
 /runs/
 /router.local.json
-
-# Local development and account/runtime data
-.idea/
-.vscode/
-__pycache__/
-*.py[cod]
-.env
-.env.*
-!.env.example
-/auth.json
-/credentials*
-/preferences.json
-*.log
-*.db
-*.db-shm
-*.db-wal
-.codegraph/
