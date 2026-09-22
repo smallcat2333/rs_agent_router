@@ -171,6 +171,8 @@ Skill 位于 `C:\Users\kaizhong_liu\PycharmProjects\Tools\skills\agent-router\SK
 
 2026-09-15 | 0.6.0 | 主页面顶部调整为三行：标题与操作按钮、CLI/模型/强度选择、执行与悬浮配置；第三行集中显示权限、超时、归档、并行和悬浮设置。cargo check 与 Clippy 通过，新版布局尚未构建 Release。
 
+2026-09-22 | 0.7.0 | 新增 Antigravity (agy) CLI 入口，支持 stream-json 事件输出；执行配置栏增加启用代理勾选与 SOCKS5 代理地址输入 (ip:port)，启用后为 agy 子进程注入 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量；项目从 Tools/supporttools 迁移至独立 GitHub 仓库。
+
 ### Desktop Commander Remote（DCR）
 
 #### 能力与前置依赖
