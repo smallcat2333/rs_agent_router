@@ -1,4 +1,28 @@
-# Agent Router 0.6.0 — CLI 执行服务
+# Agent Router 0.6.0 — CLI 任务路由与 DCR 远程调用监控
+
+Windows 桌面工具：统一管理 Claude / Codex / OpenCode CLI 任务，并托管 Desktop Commander Remote，让网页端 AI 的本机文件、终端和进程调用可见、可追踪。
+
+社区项目，与 OpenAI、Anthropic、Desktop Commander 及其他 CLI/模型供应商无官方隶属关系。
+
+[查看截图](#界面预览) · [DCR 能力、前置条件与使用方法](#desktop-commander-remotedcr) · [Windows 构建产物](https://github.com/smallcat2333/rs_agent_router/actions)
+
+## 下载与独立构建
+
+可在已成功完成的 Windows CI 运行中下载 `rs_agent_router-windows-x64` 构建产物。运行时按用途安装 CLI 或 Node.js，详细要求见下方 DCR 前置依赖。
+
+从源码构建需要 Windows 10/11 x64、Rust stable、MSVC C++ 构建工具及 Windows SDK。此 GitHub 仓库已内置 `vendor/cli-stream`，不需要相邻仓库：
+
+```powershell
+cargo test --locked
+cargo build --release --locked
+.\target\release\rs_agent_router.exe show
+```
+
+构建和单元测试不要求登录模型供应商；实际使用 CLI 时需自行安装、登录并在 AR 配置。仓库不包含本机账号、代理凭据或运行记录。
+
+## 贡献与许可
+
+原创代码采用 [MIT License](LICENSE)，参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)，内置依赖来源及许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 Harness 只分配工作，Rust App 决定执行 CLI、模型、强度、权限和超时。服务负责启动、输出、状态、取消和留痕；界面仅用于配置与监控，不维护聊天输入框、消息气泡或自建聊天历史。
 
@@ -91,7 +115,7 @@ Claude 的“异常重试”数值框默认 60 秒，自动保存并写入任务
 cargo build --release
 ```
 
-复用相邻 `../agent-harness/crates/cli-stream`（上游提交 cd42566aab9e21903e96b4d59ab7e674f7fb415d，MIT OR Apache-2.0），不自建 LLM 工具循环。保留相邻仓库即可构建。
+使用仓库内置的 `vendor/cli-stream`（上游提交 cd42566aab9e21903e96b4d59ab7e674f7fb415d，MIT OR Apache-2.0），不自建 LLM 工具循环。内置依赖保留原许可证，无需相邻仓库即可构建。
 
 首次启动时，调试构建读取项目目录 router.local.json，Release 读取 exe 同目录配置，记录根目录默认为 exe 同目录 runs；可通过 --config / --runs-dir 指定位置。之后从 exe 同目录 startup.json 恢复上次使用的配置和任务目录，显式启动参数可覆盖；已有实例通过 App 保存设置，客户端不能临时替换它。
 
@@ -113,7 +137,7 @@ cargo build --release
 
 Rust 测试中的 service 用例通过独立命名管道运行真实 Windows 替身进程，验证并发、探活、超时和进程回收，可以与用户的管理页同时运行。`verify-failures.ps1` 使用无网络替身验证桌面生命周期；`verify.ps1` 用真实 CLI 验证 App 路由、原生上下文与写入；随后 `verify-ui.ps1` 检查监控页、Esc 与图标。后三个脚本需要专用临时实例，先确认已有管理页没有工作并关闭它，不能中断正在执行的用户任务。
 
-Skill 位于 `C:\Users\kaizhong_liu\PycharmProjects\Tools\skills\agent-router\SKILL.md`，仅保存在指定目录。
+调用端可依据本节工作协议组织任务；本仓库不依赖开发机器上的 Skill 路径。
 
 ## 变更记录
 
@@ -190,7 +214,7 @@ AR 可托管 Desktop Commander Remote，将网页端的本机工具调用统一�
 - **网页端接入与授权**：网页客户端须支持远程 MCP，并完成 Desktop Commander 的连接配置及设备授权。首次授权提示可在“DCR 调用”的会话详情中查看；仅启动 AR 不会自动完成网页端连接。
 - **常驻与权限**：本机保持联网，AR 和 DCR 服务保持运行；工具以当前 Windows 用户权限访问文件和执行命令。工作目录必须存在；由 AR 托管前需结束手动启动的 DCR，避免重复实例。
 - **CLI 为可选依赖**：仅使用 DCR 工具无需安装 Claude/Codex/OpenCode；若网页端还需派发 Router 开发任务，则必须安装并登录对应 CLI，在 AR 中配置模型、权限和强度。CC Switch 不是 DCR 的必需依赖。
-- **从源码构建**：需要 Rust/MSVC 构建环境及 Windows SDK；项目的 `cli-stream` 是相邻目录 `../agent-harness/crates/cli-stream` 的本地依赖，源码分发需包含它。使用已构建 Release 不需要 Rust 工具链。
+- **从源码构建**：需要 Rust/MSVC 构建环境及 Windows SDK；本仓库的 `cli-stream` 已内置于 `vendor/cli-stream`，可独立构建，无需下载相邻项目。使用已构建 Release 不需要 Rust 工具链。
 
 #### 使用与统计
 
@@ -235,6 +259,6 @@ AR 可托管 Desktop Commander Remote，将网页端的本机工具调用统一�
 
 2026-09-16 | 0.6.0 | 修正 DCR 长日志越界，统一主卡片、详情与悬浮窗文案和时间格式；增加均耗时及累计调用，统计跟随归档时长按滚动窗口计算，跨界忙碌区间裁剪、过期样本剔除。补充 DCR 能力、Node.js/npm、网络代理、网页授权及源码构建依赖说明。33 项相关测试与 Clippy 通过，Release 已构建；主页面和悬浮窗视觉已检查，真实网页调用验收尚待完成。
 
-2026-09-16 | 0.6.0 | 补充主页面与悬浮窗实机截图、DCR 文件/终端/进程能力说明及首次使用步骤；悬浮窗等待提示缩至 10px，收紧行间距，为结果摘要留出空间。准备同步至独立 GitHub 仓库。
+2026-09-16 | 0.6.0 | 补充主页面与悬浮窗实机截图、DCR 文件/终端/进程能力说明及首次使用步骤；悬浮窗等待提示缩至 10px，收紧行间距，为结果摘要留出空间。同步至独立 GitHub 仓库，保留内置依赖、许可证及 Windows CI。
 
 2026-09-16 | 0.6.0 | 修复 Desktop Commander 0.2.50 分段读取文件后遗留句柄，导致 Qt Designer 替换保存失败的问题：AR 启动 DCR 时加载限定于其文本读取模块的流清理修复，并传递到 MCP 子进程，读取返回前等待文件关闭。不修改 npm 缓存、系统环境或用户设计文件；已有 DCR 进程不会被自动重启，修复在新版 AR 下次启动 DCR 时生效，不能回收旧进程已泄漏的句柄。可用 `node --test tests/dcr-read-stream-guard.cjs` 验证提前结束、完整读取、异常/取消和子进程传播；已用实际安装包及临时文件验证 Qt QSaveFile 替换保存成功。

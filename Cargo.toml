@@ -2,6 +2,10 @@
 name = "rs_agent_router"
 version = "0.7.0"
 edition = "2024"
+license = "MIT"
+description = "Windows task router for Claude, Codex and OpenCode CLIs, with Desktop Commander Remote monitoring."
+repository = "https://github.com/smallcat2333/rs_agent_router"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"

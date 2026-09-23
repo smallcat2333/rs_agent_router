@@ -3,7 +3,7 @@
 //! 本模块只保存会话展示所需的派生态（连接、活动调用、耗时、日志），不接触
 //! Manager、Token 或 CLI 调度；持久化快照也是独立 JSON，不进入任务索引。
 //! 原始日志行的识别建立在官方 remote-device 的实际输出格式上，核对自：
-//! `C:/Users/kaizhong_liu/AppData/Local/npm-cache/_npx/210338ee94cf9539/node_modules/@wonderwhy-er/desktop-commander/dist/remote-device/{device,remote-channel}.js`。
+//! `@wonderwhy-er/desktop-commander/dist/remote-device/{device,remote-channel}.js`。
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
