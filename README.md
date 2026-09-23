@@ -203,6 +203,8 @@ Rust 测试中的 service 用例通过独立命名管道运行真实 Windows 替
 
 2026-09-23 | 0.7.0 | Antigravity 的均耗时和 TPS 改用完成回复步骤的 duration_seconds；TPS 分子为输出 Token 加思考 Token，不含启动等待和工具步骤。旧记录不回填。
 
+2026-09-23 | 0.7.0 | 勾选允许修改文件的 Antigravity 任务追加 `--dangerously-skip-permissions`。无头模式不能弹权限框，否则读文件被拒绝且正文为空；结果里的 denied_actions 不再记为成功。
+
 ### Desktop Commander Remote（DCR）
 
 #### 能力与前置依赖

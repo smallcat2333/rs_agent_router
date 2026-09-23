@@ -339,10 +339,16 @@ impl Outcome {
             "result" => {
                 let result = &value["result"];
                 self.completed = true;
-                self.failed = result["status"] != "SUCCESS";
+                let denied = result["denied_actions"].as_array().map(|items| {
+                    items.iter().filter_map(|item| item["action"].as_str()).collect::<Vec<_>>()
+                }).unwrap_or_default();
                 self.answer = result["response"].as_str().unwrap_or("").to_owned();
+                self.failed = result["status"] != "SUCCESS" || !denied.is_empty();
                 self.usage = result["usage"].clone();
-                if self.failed {
+                if !denied.is_empty() {
+                    lines.push(format!("工具权限被拒绝 · {}", denied.join(", ")));
+                }
+                if self.failed && result["status"] != "SUCCESS" {
                     lines.push(format!("执行失败 · {}", result["status"].as_str().unwrap_or("")));
                 }
                 lines.push(format!("最终结果 · {}", self.answer));
@@ -408,6 +414,12 @@ mod tests {
         }));
         assert!(outcome.succeeded(Some(0)));
         assert_eq!(outcome.answer, "OK\n");
+        outcome.observe(Backend::Agy, &json!({
+            "event": "result",
+            "result": {"status": "SUCCESS", "response": "", "denied_actions": [{"action": "read_file"}]}
+        }));
+        assert!(outcome.failed);
+        assert!(!outcome.succeeded(Some(0)));
         outcome.observe(Backend::Agy, &json!({
             "event": "result",
             "result": {"status": "ERROR", "response": ""}

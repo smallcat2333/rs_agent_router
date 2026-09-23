@@ -138,6 +138,10 @@ pub fn arguments(task: &Task, profile: &Profile) -> Vec<String> {
             args.extend(["--effort".to_owned(), effort.clone()]);
         }
     }
+    if task.backend == Backend::Agy && task.allow_edits {
+        // 无头模式不能弹权限框。勾选允许修改文件时按 CLI 说明自动批准工具，否则读文件会被拒绝且正文为空。
+        args.push("--dangerously-skip-permissions".to_owned());
+    }
     if let Some(session) = &task.resume_session {
         if task.backend == Backend::Codex {
             args.extend(["resume".to_owned(), session.clone()]);
@@ -534,6 +538,10 @@ mod execution_contract_tests {
         assert!(args.windows(2).any(|pair| pair == ["--input-format", "text"]));
         assert!(args.windows(2).any(|pair| pair == ["--conversation", "conversation-1"]));
         assert!(args.windows(2).any(|pair| pair == ["--model", "gemini-3.8-flash-high"]));
+        assert!(!args.iter().any(|arg| arg == "--dangerously-skip-permissions"));
+        task.allow_edits = true;
+        let editable = arguments(&task, &Profile { program: "agy".into(), model: None, effort: None });
+        assert!(editable.iter().any(|arg| arg == "--dangerously-skip-permissions"));
     }
     /// 开放自测命令不改变只读任务白名单；stdin 完整保留原任务文本。
     #[test]
