@@ -201,6 +201,8 @@ Rust 测试中的 service 用例通过独立命名管道运行真实 Windows 替
 
 2026-09-23 | 0.7.0 | 去掉「代理地址为空」误报。SOCKS5 框里的 127.0.0.1:11808 原先只是占位符，保存值仍是空串；勾选代理且地址为空时写入该地址。
 
+2026-09-23 | 0.7.0 | Antigravity 的均耗时和 TPS 改用完成回复步骤的 duration_seconds；TPS 分子为输出 Token 加思考 Token，不含启动等待和工具步骤。旧记录不回填。
+
 ### Desktop Commander Remote（DCR）
 
 #### 能力与前置依赖

@@ -407,6 +407,8 @@ fn output_throughput(ui: &mut egui::Ui, record: &Record, tooltip: bool) {
             "Codex：输出 Token ÷ 排除工具执行后的模型阶段秒数；包含请求等待，≈ 表示近似值。"
         } else if record.task.backend == crate::protocol::Backend::Opencode {
             "OpenCode：已接入原生 Token 用量；未提供可靠的流式耗时，TPS 保持未知。"
+        } else if record.task.backend == crate::protocol::Backend::Agy {
+            "Antigravity：完成回复步骤的输出 Token 加思考 Token，除以该步骤 duration_seconds；不含启动等待和工具步骤。"
         } else {
             "Claude：完整响应流的输出 Token ÷ 响应流秒数；不含首字等待、工具执行及子代理。"
         };
@@ -553,6 +555,7 @@ fn reply_latency(ui: &mut egui::Ui, record: &Record, tooltip: bool) {
         let source = match reply.source.as_str() {
             "claude_request" => "等待 + 响应",
             "claude_stream" => "响应流，缺少等待时间",
+            "agy_response" => "回复步骤耗时，不含启动等待",
             _ => "CLI 回复周期，已排除工具阶段，非精确 API 耗时",
         };
         detail.push_str(&format!(

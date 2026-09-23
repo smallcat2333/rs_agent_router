@@ -90,6 +90,23 @@ impl Metrics {
                 self.first_text_ms = Some(elapsed_ms);
                 self.first_text_source = Some("text_delta".into());
             }
+            // 只取完成的回复步骤。duration_seconds 不含启动等待和工具步骤；思考发生在同一步，计入 TPS。
+            if value["event"] == "step_update"
+                && value["step_update"]["state"] == "DONE"
+                && value["step_update"]["step_type"] == "agent_response"
+                && let Some(seconds) = value["step_update"]["duration_seconds"].as_f64()
+            {
+                let duration_ms = (seconds * 1000.).round() as u64;
+                if duration_ms > 0 {
+                    self.push_reply(duration_ms, "agy_response");
+                    let usage = &value["step_update"]["usage"];
+                    let output = usage["output_tokens"].as_u64().unwrap_or(0)
+                        + usage["thinking_tokens"].as_u64().unwrap_or(0);
+                    if output > 0 {
+                        self.push_throughput(output, duration_ms);
+                    }
+                }
+            }
             if value["event"] == "result" {
                 let usage = &value["result"]["usage"];
                 if let Some(input) = usage["input_tokens"].as_u64() {
@@ -98,7 +115,6 @@ impl Metrics {
                 }
                 if let Some(output) = usage["output_tokens"].as_u64() {
                     self.output_tokens = Some(output);
-                    self.model_output_tokens = Some(output);
                 }
                 if let Some(cached) = usage["cache_read_tokens"].as_u64() {
                     self.cached_tokens = Some(cached);
@@ -519,6 +535,24 @@ mod tests {
         assert!(!metrics.tps_estimated);
         let restored: Metrics = serde_json::from_value(serde_json::to_value(&metrics).unwrap()).unwrap();
         assert_eq!(restored.output_tps(), Some(100.));
+    }
+
+    /// Antigravity 用完成回复步骤的时长和输出加思考 Token；结果事件不能改写这对数值。
+    #[test]
+    fn agy_reply_duration_and_tps_use_completed_step() {
+        let mut metrics = Metrics::default();
+        metrics.observe(Backend::Agy, &json!({"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"OK"}}), 15000);
+        metrics.observe(Backend::Agy, &json!({"event":"step_update","step_update":{"state":"DONE","step_type":"tool","duration_seconds":9.0,"usage":{"output_tokens":100}}}), 16000);
+        metrics.observe(Backend::Agy, &json!({"event":"step_update","step_update":{"state":"DONE","step_type":"agent_response","text_delta":"\n","duration_seconds":5.3408432,"usage":{"output_tokens":188,"thinking_tokens":182}}}), 17000);
+        metrics.observe(Backend::Agy, &json!({"event":"result","result":{"duration_seconds":17.1,"usage":{"input_tokens":12013,"output_tokens":188,"thinking_tokens":182,"cache_read_tokens":0}}}), 17178);
+        assert_eq!(metrics.reply_durations.len(), 1);
+        assert_eq!(metrics.reply_durations[0].duration_ms, 5341);
+        assert_eq!(metrics.reply_durations[0].source, "agy_response");
+        assert_eq!(metrics.model_output_tokens, Some(370));
+        assert_eq!(metrics.model_duration_ms, 5341);
+        assert!((metrics.output_tps().unwrap() - 69.275).abs() < 0.01);
+        assert!(!metrics.tps_estimated);
+        assert_eq!(metrics.output_tokens, Some(188));
     }
 
     /// Claude 也按单任务最近十次完整响应取窗口，不把之前响应留在分子或分母中。
