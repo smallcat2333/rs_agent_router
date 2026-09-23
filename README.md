@@ -175,6 +175,8 @@ Skill 位于 `C:\Users\kaizhong_liu\PycharmProjects\Tools\skills\agent-router\SK
 
 2026-09-23 | 0.7.0 | Antigravity 刷新改为执行 `agy models`，启用代理时带上 SOCKS5；启动不再把 `-p` 后的参数当提示词，改为 stdin 文本加 stream-json，并按 agy 的 event 结果判定成功。
 
+2026-09-23 | 0.7.0 | 去掉「代理地址为空」误报。SOCKS5 框里的 127.0.0.1:11808 原先只是占位符，保存值仍是空串；勾选代理且地址为空时写入该地址。
+
 ### Desktop Commander Remote（DCR）
 
 #### 能力与前置依赖

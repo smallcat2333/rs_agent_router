@@ -407,13 +407,6 @@ impl Dashboard {
         };
         let program = profile.program.clone();
         let backend = self.model_backend;
-        if self.preferences.backend == Backend::Agy
-            && self.preferences.agy_proxy_enabled
-            && self.preferences.agy_proxy_socks5.trim().is_empty()
-        {
-            self.error = "已启用 Antigravity 代理，但地址为空".into();
-            return;
-        }
         let proxy = if self.preferences.backend == Backend::Agy && self.preferences.agy_proxy_enabled {
             self.preferences.agy_proxy_socks5.clone()
         } else {
@@ -837,11 +830,15 @@ impl eframe::App for Dashboard {
                             if self.preferences.backend == Backend::Agy {
                                 ui.separator();
                                 ui.checkbox(&mut self.preferences.agy_proxy_enabled, "启用代理");
+                                if self.preferences.agy_proxy_enabled && self.preferences.agy_proxy_socks5.trim().is_empty() {
+                                    // 旧占位符和真实地址长得一样，空串会被当成已填写。
+                                    self.preferences.agy_proxy_socks5 = "127.0.0.1:11808".into();
+                                }
                                 if self.preferences.agy_proxy_enabled {
                                     ui.label("SOCKS5");
                                     ui.add(egui::TextEdit::singleline(&mut self.preferences.agy_proxy_socks5)
                                         .desired_width(140.)
-                                        .hint_text("127.0.0.1:11808"));
+                                        .hint_text("ip:port"));
                                 }
                             }
                         });
