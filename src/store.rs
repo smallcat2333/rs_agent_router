@@ -523,6 +523,7 @@ pub(crate) mod tests {
                 clean_start: true,
                 timeout_seconds: 1,
                 retry_timeout_seconds: 60,
+                agy_proxy: String::new(),
             },
             directory: std::env::temp_dir(),
             state: "succeeded".to_owned(),

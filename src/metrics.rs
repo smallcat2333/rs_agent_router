@@ -81,6 +81,31 @@ impl Metrics {
 
     /// 消费已验证的原生事件；不把累计 input_tokens 当作最新上下文长度。
     pub fn observe(&mut self, backend: Backend, value: &Value, elapsed_ms: u64) {
+        if backend == Backend::Agy {
+            if value["event"] == "step_update"
+                && value["step_update"]["step_type"] == "agent_response"
+                && value["step_update"]["text_delta"].as_str().is_some_and(|text| !text.trim().is_empty())
+                && self.first_text_ms.is_none()
+            {
+                self.first_text_ms = Some(elapsed_ms);
+                self.first_text_source = Some("text_delta".into());
+            }
+            if value["event"] == "result" {
+                let usage = &value["result"]["usage"];
+                if let Some(input) = usage["input_tokens"].as_u64() {
+                    self.input_tokens = Some(input);
+                    self.context_tokens = Some(input);
+                }
+                if let Some(output) = usage["output_tokens"].as_u64() {
+                    self.output_tokens = Some(output);
+                    self.model_output_tokens = Some(output);
+                }
+                if let Some(cached) = usage["cache_read_tokens"].as_u64() {
+                    self.cached_tokens = Some(cached);
+                }
+            }
+            return;
+        }
         if backend == Backend::Opencode {
             if value["type"] == "step_finish" && value["part"]["tokens"].is_object() {
                 let tokens = &value["part"]["tokens"];
@@ -300,6 +325,11 @@ fn claude_input(usage: &Value) -> Option<u64> {
 
 /// 检测用户可见文本，思考、心跳和工具参数不算首字。
 pub fn visible_text(backend: Backend, value: &Value) -> bool {
+    if backend == Backend::Agy {
+        return value["event"] == "step_update"
+            && value["step_update"]["step_type"] == "agent_response"
+            && value["step_update"]["text_delta"].as_str().is_some_and(|text| !text.trim().is_empty());
+    }
     if backend == Backend::Opencode {
         return value["type"] == "text" && value["part"]["text"].as_str().is_some_and(|text| !text.trim().is_empty());
     }

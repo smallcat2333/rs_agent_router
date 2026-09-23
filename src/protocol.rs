@@ -207,6 +207,9 @@ impl Outcome {
         if backend == Backend::Opencode {
             return crate::opencode::observe(self, value);
         }
+        if backend == Backend::Agy {
+            return self.observe_agy(value);
+        }
         let mut lines = Vec::new();
         let kind = value["type"].as_str().unwrap_or("");
         if backend != Backend::Codex {
@@ -307,6 +310,48 @@ impl Outcome {
         lines
     }
 
+    /// 归一 Antigravity 的 event 流；不用 Claude 的 type 字段，避免把未识别事件当成成功。
+    fn observe_agy(&mut self, value: &Value) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(id) = value["conversation_id"].as_str().or(value["result"]["conversation_id"].as_str()) {
+            self.session_id = Some(id.to_owned());
+        }
+        match value["event"].as_str().unwrap_or("") {
+            "init" => {
+                self.cli_model = value["init"]["model"].as_str().map(str::to_owned);
+                lines.push(format!(
+                    "会话已建立 · {}",
+                    self.cli_model.as_deref().unwrap_or("CLI 未报告模型")
+                ));
+            }
+            "step_update" => {
+                let step = &value["step_update"];
+                let step_type = step["step_type"].as_str().unwrap_or("");
+                if step_type == "agent_response" {
+                    if let Some(text) = step["text_delta"].as_str().filter(|text| !text.is_empty()) {
+                        lines.push(text.to_owned());
+                    }
+                } else if step_type != "user_input" && step["state"] == "ACTIVE" {
+                    self.tool_calls += 1;
+                    lines.push(format!("工具调用 · {step_type}"));
+                }
+            }
+            "result" => {
+                let result = &value["result"];
+                self.completed = true;
+                self.failed = result["status"] != "SUCCESS";
+                self.answer = result["response"].as_str().unwrap_or("").to_owned();
+                self.usage = result["usage"].clone();
+                if self.failed {
+                    lines.push(format!("执行失败 · {}", result["status"].as_str().unwrap_or("")));
+                }
+                lines.push(format!("最终结果 · {}", self.answer));
+            }
+            _ => {}
+        }
+        lines
+    }
+
     /// 必须同时收到成功结果和退出码 0，防止静默退出误判完成。
     pub fn succeeded(&self, code: Option<i32>) -> bool {
         code == Some(0) && self.completed && !self.failed
@@ -341,6 +386,34 @@ mod tests {
         );
         assert_eq!(outcome.reported_model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(outcome.cli_model.as_deref(), Some("GLM-5.3"));
+    }
+    /// Antigravity 用 event 而不是 type；成功结果必须记完成，非 SUCCESS 必须记失败。
+    #[test]
+    fn agy_result_event_sets_completion() {
+        let mut outcome = Outcome::default();
+        outcome.observe(Backend::Agy, &json!({
+            "event": "init",
+            "conversation_id": "c1",
+            "init": {}
+        }));
+        assert_eq!(outcome.session_id.as_deref(), Some("c1"));
+        assert!(!outcome.completed);
+        outcome.observe(Backend::Agy, &json!({
+            "event": "step_update",
+            "step_update": {"state": "ACTIVE", "step_type": "agent_response", "text_delta": "OK"}
+        }));
+        outcome.observe(Backend::Agy, &json!({
+            "event": "result",
+            "result": {"status": "SUCCESS", "response": "OK\n", "conversation_id": "c1"}
+        }));
+        assert!(outcome.succeeded(Some(0)));
+        assert_eq!(outcome.answer, "OK\n");
+        outcome.observe(Backend::Agy, &json!({
+            "event": "result",
+            "result": {"status": "ERROR", "response": ""}
+        }));
+        assert!(outcome.failed);
+        assert!(!outcome.succeeded(Some(0)));
     }
     /// 分组最多三级，空分组允许，超深和空名称必须拒绝。
     #[test]
@@ -382,6 +455,7 @@ mod tests {
                 clean_start: true,
                 timeout_seconds: 300,
                 retry_timeout_seconds: 60,
+                agy_proxy: String::new(),
             },
             &Profile {
                 program: PathBuf::new(),

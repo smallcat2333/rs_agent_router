@@ -72,13 +72,12 @@ fn execution_prompt(prompt: &str) -> String {
 /// 构造逐项参数；提示词经 stdin 传输，避免 shell 转义和命令行长度限制。
 pub fn arguments(task: &Task, profile: &Profile) -> Vec<String> {
     let mut args: Vec<String> = if task.backend == Backend::Agy {
-        // Antigravity CLI 使用与 Claude 兼容的 stream-json 输出。
+        // agy 的 -p/--print 会吃掉下一个参数当提示词，提示词只走 stdin。
         vec![
-            "-p",
             "--output-format",
             "stream-json",
-            "--verbose",
-            "--include-partial-messages",
+            "--input-format",
+            "text",
         ]
     } else if task.backend == Backend::Opencode {
         vec!["run", "--format", "json", "--thinking"]
@@ -144,6 +143,8 @@ pub fn arguments(task: &Task, profile: &Profile) -> Vec<String> {
             args.extend(["resume".to_owned(), session.clone()]);
         } else if task.backend == Backend::Opencode {
             args.extend(["--session".to_owned(), session.clone()]);
+        } else if task.backend == Backend::Agy {
+            args.extend(["--conversation".to_owned(), session.clone()]);
         } else {
             args.extend(["--resume".to_owned(), session.clone()]);
         }
@@ -401,7 +402,7 @@ fn execute(
                                     let _ =
                                         tx.send(Update::Metrics(Box::new(outcome.metrics.clone())));
                                 }
-                                if value["type"] == "stream_event"
+                                if (value["type"] == "stream_event" || task.backend == Backend::Agy)
                                     && crate::metrics::visible_text(task.backend, &value)
                                     && (old.first_text_ms.is_none()
                                         || last_text_activity.elapsed()
@@ -520,6 +521,19 @@ mod execution_contract_tests {
                 }
             }
         }
+    }
+    /// Antigravity 的 -p 会吞掉下一个参数，提示词只能走 stdin。
+    #[test]
+    fn agy_arguments_do_not_attach_prompt_flag() {
+        let mut task = crate::store::tests::sample("agy-args").task;
+        task.backend = Backend::Agy;
+        task.resume_session = Some("conversation-1".into());
+        let args = arguments(&task, &Profile { program: "agy".into(), model: Some("gemini-3.8-flash-high".into()), effort: None });
+        assert!(!args.iter().any(|arg| arg == "-p" || arg == "--print" || arg == "--prompt"));
+        assert!(args.windows(2).any(|pair| pair == ["--output-format", "stream-json"]));
+        assert!(args.windows(2).any(|pair| pair == ["--input-format", "text"]));
+        assert!(args.windows(2).any(|pair| pair == ["--conversation", "conversation-1"]));
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gemini-3.8-flash-high"]));
     }
     /// 开放自测命令不改变只读任务白名单；stdin 完整保留原任务文本。
     #[test]

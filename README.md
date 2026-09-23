@@ -173,6 +173,8 @@ Skill 位于 `C:\Users\kaizhong_liu\PycharmProjects\Tools\skills\agent-router\SK
 
 2026-09-22 | 0.7.0 | 新增 Antigravity (agy) CLI 入口，支持 stream-json 事件输出；执行配置栏增加启用代理勾选与 SOCKS5 代理地址输入 (ip:port)，启用后为 agy 子进程注入 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量；项目从 Tools/supporttools 迁移至独立 GitHub 仓库。
 
+2026-09-23 | 0.7.0 | Antigravity 刷新改为执行 `agy models`，启用代理时带上 SOCKS5；启动不再把 `-p` 后的参数当提示词，改为 stdin 文本加 stream-json，并按 agy 的 event 结果判定成功。
+
 ### Desktop Commander Remote（DCR）
 
 #### 能力与前置依赖

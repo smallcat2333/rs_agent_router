@@ -407,12 +407,28 @@ impl Dashboard {
         };
         let program = profile.program.clone();
         let backend = self.model_backend;
+        if self.preferences.backend == Backend::Agy
+            && self.preferences.agy_proxy_enabled
+            && self.preferences.agy_proxy_socks5.trim().is_empty()
+        {
+            self.error = "已启用 Antigravity 代理，但地址为空".into();
+            return;
+        }
+        let proxy = if self.preferences.backend == Backend::Agy && self.preferences.agy_proxy_enabled {
+            self.preferences.agy_proxy_socks5.clone()
+        } else {
+            String::new()
+        };
         let (tx, rx) = mpsc::channel();
         self.model_refresh = Some(rx);
         std::thread::spawn(move || {
             let _ = tx.send(
                 (if backend == Backend::Opencode {
                     crate::opencode::catalog(&program)
+                } else if backend == Backend::Agy {
+                    crate::model_catalog::agy_models(&program, &proxy).map(|models| {
+                        crate::opencode::Catalog { models, ..Default::default() }
+                    })
                 } else {
                     crate::model_catalog::discover(backend, &program).map(|models|
                         crate::opencode::Catalog { models, ..Default::default() })
@@ -690,7 +706,7 @@ impl eframe::App for Dashboard {
                                         "刷新"
                                     }),
                                 )
-                                .on_hover_text("Claude 重读 CC Switch；Codex / OpenCode 查询各自 CLI 的可选模型列表")
+                                .on_hover_text("Claude 重读 CC Switch；Codex / OpenCode / Antigravity 查询各自 CLI 的可选模型列表")
                                 .clicked();
                             test_model = ui
                                 .add_enabled(!shutting, egui::Button::new("测试"))
@@ -1358,6 +1374,8 @@ mod tests {
             main_size: Some([1280., 800.]),
             floating_bottom: Some([100., 900.]),
             archived: true,
+            agy_proxy_enabled: false,
+            agy_proxy_socks5: String::new(),
         };
         let restored: Preferences =
             serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();

@@ -1,4 +1,4 @@
-//! Claude 读取当前供应商模型映射；Codex 通过 CLI 查询完整可选模型目录。
+//! Claude 读取当前供应商模型映射；Codex 与 Antigravity 通过各自 CLI 查询可选模型。
 use crate::protocol::Backend;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags};
@@ -14,8 +14,7 @@ pub fn discover(backend: Backend, program: &Path) -> Result<Vec<String>> {
         return codex_models(program);
     }
     if backend == Backend::Agy {
-        // Antigravity 暂不支持自动模型发现，手动输入。
-        return Ok(Vec::new());
+        return agy_models(program, "");
     }
     let home = std::env::var_os("USERPROFILE").context("无法确定用户配置目录")?;
     let home = Path::new(&home);
@@ -61,6 +60,72 @@ pub fn discover(backend: Backend, program: &Path) -> Result<Vec<String>> {
         }
     }
     ensure!(!models.is_empty(), "当前 CC Switch / CLI 配置没有声明模型");
+    Ok(models)
+}
+
+/// 查询 Antigravity 模型目录。proxy 为 ip:port，空串不注入代理；超时后回收进程。
+pub fn agy_models(program: &Path, proxy: &str) -> Result<Vec<String>> {
+    let mut command = cli_stream::Command::new(program)
+        .args(["models"])
+        .stdin(cli_stream::Stdin::Piped);
+    if !proxy.is_empty() {
+        let url = format!("socks5://{proxy}");
+        command = command.env([
+            ("HTTP_PROXY", url.clone()),
+            ("HTTPS_PROXY", url.clone()),
+            ("ALL_PROXY", url),
+        ]);
+    }
+    let (process, events) = command.start()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    let result = (|| {
+        process.close_stdin()?;
+        let mut stdout = String::new();
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .context("Antigravity 模型查询超时（25 秒）")?;
+            match events
+                .recv_timeout(remaining)
+                .context("Antigravity 模型查询超时或连接关闭")?
+            {
+                cli_stream::Event::Stdout { line, .. } => {
+                    stdout.push_str(&line);
+                    stdout.push('\n');
+                }
+                cli_stream::Event::Exited { exit_code, .. } => {
+                    ensure!(
+                        exit_code == Some(0),
+                        "Antigravity 模型查询失败，退出码 {exit_code:?}"
+                    );
+                    return parse_agy_models(&stdout);
+                }
+                cli_stream::Event::Error { message, .. } => {
+                    anyhow::bail!("Antigravity 进程错误：{message}")
+                }
+                _ => {}
+            }
+        }
+    })();
+    let _ = process.cancel();
+    result
+}
+
+/// 取制表符前的模型 ID，跳过状态行；没有模型 ID 时失败，不返回空列表冒充成功。
+pub fn parse_agy_models(text: &str) -> Result<Vec<String>> {
+    let models: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let (id, _) = line.split_once('\t')?;
+            let id = id.trim();
+            if id.is_empty() || id.contains(' ') {
+                None
+            } else {
+                Some(id.to_owned())
+            }
+        })
+        .collect();
+    ensure!(!models.is_empty(), "Antigravity CLI 未返回可选模型");
     Ok(models)
 }
 
@@ -285,5 +350,16 @@ mod tests {
             configured_models(&settings),
             vec!["glm-5.3", "deepseek-v4-flash", "auto"]
         );
+    }
+
+    /// 状态行和展示名不能进入模型 ID 列表。
+    #[test]
+    fn agy_model_lines_keep_ids_only() {
+        let text = "Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n";
+        assert_eq!(
+            parse_agy_models(text).unwrap(),
+            ["gemini-3.8-flash-high", "claude-sonnet-4-6"]
+        );
+        assert!(parse_agy_models("Fetching available models...\n").is_err());
     }
 }
