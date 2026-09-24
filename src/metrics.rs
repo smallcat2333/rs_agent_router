@@ -372,7 +372,7 @@ pub fn visible_text(backend: Backend, value: &Value) -> bool {
     }
 }
 
-/// 保留请求与回复两份证据；切换后以最后实际回复模型归属提交，缺少身份或强度时不生成前缀。
+/// 保留请求与回复两份证据；AGY 缺少实际模型时标为 unknown，其余后端缺少身份或强度不生成前缀。
 pub fn executor(
     backend: Backend,
     requested: Option<&str>,
@@ -389,17 +389,21 @@ pub fn executor(
     } else {
         (configured, configured.map(|_| "app_config"))
     };
-    let prefix = model
-        .zip(effort)
-        .filter(|(m, e)| observed.is_some() && (component(m) || backend == Backend::Opencode && m.split('/').all(component)) && component(e))
-        .map(|(m, e)| {
-            format!(
-                "[ar-{}-{}-{}]",
-                backend.short(),
-                m.to_lowercase().replace('/', "-"),
-                e.to_lowercase()
-            )
-        });
+    let prefix = if backend == Backend::Agy {
+        Some(format!("[ar-agy-{}]", observed.filter(|m| component(m)).unwrap_or("unknown").to_lowercase()))
+    } else {
+        model
+            .zip(effort)
+            .filter(|(m, e)| observed.is_some() && (component(m) || backend == Backend::Opencode && m.split('/').all(component)) && component(e))
+            .map(|(m, e)| {
+                format!(
+                    "[ar-{}-{}-{}]",
+                    backend.short(),
+                    m.to_lowercase().replace('/', "-"),
+                    e.to_lowercase()
+                )
+            })
+    };
     json!({"cli":backend,"requested_model":requested,"reported_model":reported,
         "model":model,"model_source":source,"model_conflict":conflict,
         "effort":effort,"effort_source":effort.map(|_| "app_config"),"commit_prefix":prefix})
@@ -786,5 +790,11 @@ mod tests {
         );
         assert_eq!(conflict["model_conflict"], true);
         assert_eq!(conflict["commit_prefix"], "[ar-cc-other-model-high]");
+        let agy_unknown = executor(Backend::Agy, Some("gemini-3.8-flash-high"), None, None);
+        assert_eq!(agy_unknown["model_source"], "app_config");
+        assert_eq!(agy_unknown["reported_model"], Value::Null);
+        assert_eq!(agy_unknown["commit_prefix"], "[ar-agy-unknown]");
+        let agy_reported = executor(Backend::Agy, Some("gemini-3.8-flash-high"), None, Some("gemini-3.8-pro"));
+        assert_eq!(agy_reported["commit_prefix"], "[ar-agy-gemini-3.8-pro]");
     }
 }

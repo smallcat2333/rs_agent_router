@@ -76,7 +76,7 @@ Skill 的分组固定为 **来源 → APP → Feat → 小任务叶子**：例�
 
 stdout 事件：accepted、progress（仅 --events）、finished、status、health、cancel_requested、shown、error。非等待提交退出 0 只表示接收成功；`--wait` 仅在本次执行 succeeded 时退出 0。GPT/Harness 必须另外核对文件差异和验收结果。
 
-结果的 `executor` 返回 CLI、请求模型、报告模型、强度、取值来源及 `commit_prefix`。Router 任务审计通过后按 `[ar-cc-模型-强度]` / `[ar-cx-模型-强度]` 记录执行来源；主 Harness 可以串行代提交，直接实现仍用项目原前缀。模型切换后任务顶部及提交归属采用最后有效回复模型，保留请求模型和冲突标记供核对。App 配置值不证明代理实际路由；通用别名、合成错误消息不能证明模型，缺少实际模型或强度时前缀为空，不猜身份。程序不会自动提交代码。
+结果的 `executor` 返回 CLI、请求模型、报告模型、强度、取值来源及 `commit_prefix`。Router 任务审计通过后按 `[ar-cc-模型-强度]` / `[ar-cx-模型-强度]` / `[ar-oc-provider-model-variant]` / `[ar-agy-模型]` 记录执行来源；主 Harness 可以串行代提交，直接实现仍用项目原前缀。模型切换后任务顶部及提交归属采用最后有效回复模型，保留请求模型和冲突标记供核对。App 配置值不证明代理实际路由；通用别名、合成错误消息不能证明模型。AGY 没有实际回复模型证据时使用 `[ar-agy-unknown]`，其余后端缺少实际模型或强度时前缀为空，不猜身份。程序不会自动提交代码。
 
 ## 监控与留痕
 
@@ -204,6 +204,8 @@ Rust 测试中的 service 用例通过独立命名管道运行真实 Windows 替
 2026-09-23 | 0.7.0 | Antigravity 的均耗时和 TPS 改用完成回复步骤的 duration_seconds；TPS 分子为输出 Token 加思考 Token，不含启动等待和工具步骤。旧记录不回填。
 
 2026-09-23 | 0.7.0 | 勾选允许修改文件的 Antigravity 任务追加 `--dangerously-skip-permissions`。无头模式不能弹权限框，否则读文件被拒绝且正文为空；结果里的 denied_actions 不再记为成功。
+
+2026-09-24 | 0.7.0 | Antigravity 结果未报告实际回复模型时，将经 Router 执行任务的提交归属标为 `[ar-agy-unknown]`；保留请求配置模型供核对，不将其冒充实际模型。
 
 ### Desktop Commander Remote（DCR）
 
