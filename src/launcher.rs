@@ -112,6 +112,11 @@ struct Dashboard {
     model_variants: std::collections::BTreeMap<String, Vec<String>>,
     model_backend: Backend,
     model_refresh: Option<mpsc::Receiver<Result<crate::opencode::Catalog, String>>>,
+    quality_open: bool,
+    quality_selection: Option<(Backend, String)>,
+    quality_reference: String,
+    quality_status: String,
+    quality_run: Option<crate::model_quality::Run>,
     selected: Option<String>,
     detail_tab: u8,
     detail_content: String,
@@ -151,6 +156,63 @@ fn tray_visibility(event: &TrayIconEvent, visible: bool, minimized: bool) -> Opt
 }
 
 impl Dashboard {
+    /// 固定按钮点击时的模型快照；启动后切换顶部模型不会改变正在采样的对象。
+    fn start_quality_test(&mut self) {
+        let Some((backend, model)) = self.quality_selection.clone() else { return; };
+        self.quality_status = "正在读取供应商配置与基准…".into();
+        self.quality_run = Some(crate::model_quality::start(backend, model, self.quality_reference.trim().to_owned()));
+    }
+
+    /// 非阻塞接收检测进度；关闭窗口保留检测，取消或退出时回收专属进程。
+    fn quality_window(&mut self, ctx: &egui::Context) {
+        let mut finished = false;
+        if let Some(run) = &self.quality_run {
+            loop {
+                match run.updates.try_recv() {
+                    Ok(update) => {
+                        self.quality_status = update.text;
+                        finished |= update.finished;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if !finished { self.quality_status = "检测工作线程已退出，未返回完整结果".into(); }
+                        finished = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
+        }
+        if finished { self.quality_run = None; }
+        if !self.quality_open { return; }
+        let mut open = self.quality_open;
+        egui::Window::new("模型质量测试").open(&mut open).default_width(620.).show(ctx, |ui| {
+            if let Some((backend, model)) = &self.quality_selection {
+                ui.label(format!("检测对象：{} / {model}", backend.key()));
+            }
+            ui.label("直接检测供应商 API · quick：4 维度 × 15 次采样，另含参数探测请求");
+            ui.add_enabled_ui(self.quality_run.is_none(), |ui| {
+                ui.label("基准 JSON（留空自动匹配内置基准）");
+                ui.add(egui::TextEdit::singleline(&mut self.quality_reference).desired_width(f32::INFINITY)
+                    .hint_text("该模型在可信端点录制的指纹文件完整路径"));
+            });
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.quality_run.is_none() && self.quality_selection.is_some(), egui::Button::new("重新测试")).clicked() {
+                    self.start_quality_test();
+                }
+                if let Some(run) = &self.quality_run {
+                    ui.spinner();
+                    if ui.button("取消").clicked() {
+                        run.stop.store(true, Ordering::Relaxed);
+                        self.quality_status = "正在取消…".into();
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(&self.quality_status);
+        });
+        self.quality_open = open;
+    }
+
     /// 顶部设置仅管理 DCR 服务，日志统一展示在主页面会话中。
     fn dcr_window(&mut self, ctx: &egui::Context) {
         if !self.dcr_open { return; }
@@ -495,6 +557,7 @@ impl eframe::App for Dashboard {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.dcr.poll();
         self.dcr_window(ctx);
+        self.quality_window(ctx);
         let now = runner::now_ms() as i64;
         let old_geometry = (self.preferences.main_size, self.preferences.floating_bottom);
         ctx.input(|input| {
@@ -545,6 +608,7 @@ impl eframe::App for Dashboard {
         let mut actions = Vec::new();
         let mut refresh_models = false;
         let mut test_model = false;
+        let mut quality_test = false;
         let (records, running, shutting, error) = {
             let m = self.manager.lock().unwrap();
             (
@@ -671,10 +735,16 @@ impl eframe::App for Dashboard {
                                         std::env::var_os("APPDATA").map(PathBuf::from)
                                             .map(|path| path.join("npm/node_modules/opencode-ai/bin/opencode.exe"))
                                             .filter(|path| path.is_file()).unwrap_or_else(|| "opencode".into())
+                                    } else if self.preferences.backend == Backend::Agy {
+                                        which_agy().unwrap_or_else(|| "agy".into())
                                     } else { PathBuf::new() },
                                     model: None,
                                     effort: None,
                                 });
+                            // 已有 profile 但路径为空时，尝试自动填充。
+                            if profile.program.as_os_str().is_empty() && self.preferences.backend == Backend::Agy {
+                                if let Some(found) = which_agy() { profile.program = found; }
+                            }
                             let mut path = profile.program.display().to_string();
                             ui.add_space(8.);
                             ui.label("CLI");
@@ -704,6 +774,9 @@ impl eframe::App for Dashboard {
                             test_model = ui
                                 .add_enabled(!shutting, egui::Button::new("测试"))
                                 .on_hover_text("用所选配置提交一次模型测试任务")
+                                .clicked();
+                            quality_test = ui.add_enabled(!shutting, egui::Button::new("模型质量测试"))
+                                .on_hover_text("直接采样当前供应商 API；指纹匹配且 API 回报模型一致才通过")
                                 .clicked();
                             ui.add_space(8.);
                             if self.preferences.backend != Backend::Opencode {
@@ -861,6 +934,16 @@ impl eframe::App for Dashboard {
                         Ok(()) => String::new(),
                         Err(error) => format!("模型测试启动失败：{error:#}"),
                     };
+                }
+                if quality_test {
+                    self.quality_open = true;
+                    if self.quality_run.is_none() {
+                        self.quality_selection = self.editing_profiles[self.preferences.backend.key()].model.clone()
+                            .map(|model| (self.preferences.backend, model));
+                        self.quality_reference.clear();
+                        if self.quality_selection.is_some() { self.start_quality_test(); }
+                        else { self.quality_status = "请先选择具体模型，CLI 默认无法确定检测对象".into(); }
+                    }
                 }
                 if !self.error.is_empty() {
                     ui.colored_label(egui::Color32::LIGHT_RED, &self.error);
@@ -1089,8 +1172,16 @@ impl eframe::App for Dashboard {
     }
 }
 
-/// 尝试从 PATH 中定位 agy 可执行文件，找不到返回 None。
+/// 尝试定位 agy 可执行文件：先检查标准安装路径，再搜索 PATH。
 fn which_agy() -> Option<PathBuf> {
+    // 标准安装路径：%LOCALAPPDATA%\agy\bin\agy.exe
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let standard = PathBuf::from(local).join(r"agy\bin\agy.exe");
+        if standard.is_file() {
+            return Some(standard);
+        }
+    }
+    // 回退：从 PATH 搜索
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|dir| dir.join("agy.exe"))
@@ -1289,6 +1380,11 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
                 model_choices: Vec::new(),
                 model_variants: Default::default(),
                 model_refresh: None,
+                quality_open: false,
+                quality_selection: None,
+                quality_reference: String::new(),
+                quality_status: String::new(),
+                quality_run: None,
                 archived: preferences.archived,
                 preferences,
                 editing_profiles: profiles,

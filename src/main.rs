@@ -8,6 +8,7 @@ mod launcher;
 mod manager;
 mod metrics;
 mod model_catalog;
+mod model_quality;
 mod model_efforts;
 mod opencode;
 mod protocol;

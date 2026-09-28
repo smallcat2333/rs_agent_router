@@ -44,6 +44,12 @@ Harness 只分配工作，Rust App 决定执行 CLI、模型、强度、权限�
 
 模型下拉框支持刷新：Claude 读取 CC Switch 当前供应商配置，Codex 在后台查询所选 CLI 的模型目录；“测试”按当前配置创建独立的“模型测试”分组任务。强度按 `assets/model_efforts.json` 的本地维护表显示，含资料来源和核对日期，不随刷新联网查询；切换模型时不支持的旧档位恢复默认。Claude 使用 `--effort`，Codex 使用 `model_reasoning_effort`；“默认”表示不覆盖原 CLI 默认值。超时默认 300 秒，归档默认 4h，顶部设置修改后自动记忆。
 
+“模型质量测试”固定点击时所选模型，直接向对应供应商的 OpenAI 兼容 `/chat/completions` API 采样。需要本机 Node.js 与已编译、通过 `npm link` 注册的 `llm-fingerprint-detector`；不经过 CLI 对话。Claude / Codex 优先读取 CC Switch 当前供应商，未配置时读取 CLI 配置；OpenCode 按所选 `provider/model` 读取本地 `opencode.json`（支持 `OPENCODE_CONFIG`），使用 `options.baseURL/apiKey`，支持密钥环境变量引用。订阅登录、Antigravity、仅提供 Anthropic Messages / OpenAI Responses 的端点不能直接使用此检测。
+
+按钮默认执行 quick（4 维度 × 15 次，另有参数探测请求），后台显示进度，支持取消，总时限约 190 秒。自动寻找唯一同名内置基准；缺少时可在结果窗口填写可信端点录制的基准 JSON 并重新测试。只有指纹 `MATCH`（JSD ≤ 0.25，至少 4 个可比维度）、基准模型与所选模型相符、全部成功响应的 `model` 非空且一致时显示“通过”；灰度区、指纹不匹配、样本不足或回报模型不同均不算通过。比较时忽略供应商前缀，版本后缀必须一致。结果展示 API 真实回报模型，不能用检测器回显的请求模型代替。内置基准协议差异和推理降级会单独提示，统计匹配用于初筛。密钥仅经子进程 stdin 传入，不进入命令行、结果或 AR 配置。界面结果保留在本次运行内。
+
+离线验证：`cargo test --offline model_quality` 与 `node --test tests/model-quality.test.mjs`；后者使用本地模拟 API，不调用真实供应商、不消耗账号额度。
+
 OpenCode 首次选择时自动定位本机 npm 安装的 CLI；通过 `opencode models --verbose` 获取 `provider/model` 和原生 variant，不套用 Claude/Codex 强度表。使用 `run --format json`、stdin 提示词及 `--session` 续聊；认证沿用 CC Switch 写入的 OpenCode 配置。只读任务通过 `OPENCODE_PERMISSION` 拒绝编辑和 Bash，可编辑任务开放对应能力，不传 `--auto`。共享现有排队、取消及无输出超时；纯净启动与异常重试时限仍仅用于 Claude。原生错误直接回传，Token 用量来自 step_finish；未提供可靠流式耗时的 TPS 显示未知。执行模型通过本轮 messageID 对应的 `opencode export` 元数据确认，提交前缀为 `[ar-oc-provider-model-variant]`，缺少 variant 或身份时不猜测。
 
 强度表于 2026-09-14 按厂商文档、本机 Codex `model/list` 和 OpenCode 官方模型目录核对。Muse Spark 1.3 标准版最高 `max`，1.3 Contributor 根据用户当前渠道的回执与明确要求开放 `max`；Grok 4.6 最高 `xhigh`；Qwen 3.8 的有效档位为 `low/medium/xhigh`。API 的 `none/minimal`、思考开关、token 预算和同义映射不列为当前 CLI 的额外强度。Codex 的 `ultra` 包含自动任务委派，不能当作通用 API 档位；厂商能力与具体供应商支持范围可能不同，详见各模型 tooltip。菜单与参数验证不证明上游实际采用该强度。
@@ -268,3 +274,5 @@ AR 可托管 Desktop Commander Remote，将网页端的本机工具调用统一�
 2026-09-16 | 0.6.0 | 补充主页面与悬浮窗实机截图、DCR 文件/终端/进程能力说明及首次使用步骤；悬浮窗等待提示缩至 10px，收紧行间距，为结果摘要留出空间。同步至独立 GitHub 仓库，保留内置依赖、许可证及 Windows CI。
 
 2026-09-16 | 0.6.0 | 修复 Desktop Commander 0.2.50 分段读取文件后遗留句柄，导致 Qt Designer 替换保存失败的问题：AR 启动 DCR 时加载限定于其文本读取模块的流清理修复，并传递到 MCP 子进程，读取返回前等待文件关闭。不修改 npm 缓存、系统环境或用户设计文件；已有 DCR 进程不会被自动重启，修复在新版 AR 下次启动 DCR 时生效，不能回收旧进程已泄漏的句柄。可用 `node --test tests/dcr-read-stream-guard.cjs` 验证提前结束、完整读取、异常/取消和子进程传播；已用实际安装包及临时文件验证 Qt QSaveFile 替换保存成功。
+
+2026-09-28 | 0.7.0 | 新增模型质量测试按钮，直接检测所选供应商 API，结合指纹与真实响应模型判定；支持进度、取消及本地基准。4 项供应商配置测试、4 项界面配置回归、1 项 Rust 到 Node 管道验证及 7 项本地模拟 API 测试通过；Debug 已构建，真实供应商与窗口操作待实测。
