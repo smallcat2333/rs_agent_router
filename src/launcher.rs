@@ -487,6 +487,20 @@ impl Dashboard {
             );
         });
     }
+    /// 通过正常 Harness 工作契约提交测试，继承所选执行快照且独立留痕归档。
+    fn test_model(&mut self, now: i64) -> Result<()> {
+        let mut manager = self.manager.lock().unwrap();
+        let work = crate::protocol::Work {
+            task_id: format!("model-test-{}", uuid::Uuid::new_v4()),
+            title: Some(format!("模型测试 · {}", self.editing_profiles[self.preferences.backend.key()].model.as_deref().unwrap_or("CLI 默认"))),
+            group_path: vec!["模型测试".into(), "rs_agent_router".into(), "连通性测试".into()],
+            workdir: manager.root.clone(),
+            prompt: "这是 Harness 发起的模型连通性测试。请只回复 ROUTER_MODEL_OK，不调用工具，不读取或修改文件。".into(),
+        };
+        manager.submit(work, now)?;
+        self.archived = false;
+        Ok(())
+    }
     /// 加载选中任务详情，不改变任务活动时间；日志显示尾部，完整文件仍保留。
     fn load_detail(&mut self) {
         let manager = self.manager.lock().unwrap();
@@ -588,6 +602,7 @@ impl eframe::App for Dashboard {
         };
         let mut actions = Vec::new();
         let mut refresh_models = false;
+        let mut test_model = false;
         let mut quality_test = false;
         let (records, running, shutting, error) = {
             let m = self.manager.lock().unwrap();
@@ -751,6 +766,10 @@ impl eframe::App for Dashboard {
                                 )
                                 .on_hover_text("Claude 重读 CC Switch；Codex / OpenCode / Antigravity 查询各自 CLI 的可选模型列表")
                                 .clicked();
+                            test_model = ui
+                                .add_enabled(!shutting, egui::Button::new("测试"))
+                                .on_hover_text("用所选配置提交一次模型测试任务")
+                                .clicked();
                             quality_test = ui.add_enabled(!shutting, egui::Button::new("模型质量测试"))
                                 .on_hover_text("三次数字挑战；ModelTrace 识别结果与所选模型、API 回报一致才通过")
                                 .clicked();
@@ -904,6 +923,12 @@ impl eframe::App for Dashboard {
                 }
                 if refresh_models || self.model_backend != self.preferences.backend {
                     self.refresh_models();
+                }
+                if test_model {
+                    self.error = match self.save_settings().and_then(|_| self.test_model(now)) {
+                        Ok(()) => String::new(),
+                        Err(error) => format!("模型测试启动失败：{error:#}"),
+                    };
                 }
                 if quality_test {
                     self.quality_open = true;
