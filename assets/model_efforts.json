@@ -1,8 +1,9 @@
 {
-  "verified_at": "2026-09-14",
-  "maintenance": "人工核对后更新本文件并重新构建。运行期间只读内嵌表，不联网、不通过刷新模型按钮更新强度。levels 记录当前 CLI 能使用的有效离散强度；思考开关、同义映射不伪装成额外强度。未知模型及 CLI 默认仅提供默认强度。",
+  "verified_at": "2026-09-29",
+  "maintenance": "人工核对后更新本文件并重新构建。verified_at 是最近维护日期，历史条目的来源与限制按各自 sources/note 保留，不代表全表均已重新实测。运行期间只读内嵌表，不联网、不通过刷新模型按钮更新强度。levels 记录当前 CLI 能使用的有效离散强度；思考开关、同义映射不伪装成额外强度。未知模型及 CLI 默认仅提供默认强度。",
   "sources": {
-    "codex_cli": "2026-09-14 本机 Codex CLI app-server model/list 实际返回的 6 个模型及 supportedReasoningEfforts；仅本次维护查询，不在运行时刷新",
+    "codex_cli": "2026-09-29 本机 Codex 桌面端内置 CLI app-server model/list 实际返回的 7 个模型及 supportedReasoningEfforts；npm CLI 仅返回其中 5 个旧型号。仅本次维护查询，不在运行时刷新",
+    "codex_cli_20260914": "2026-09-14 本机 Codex CLI model/list 历史快照，包含 gpt-5.2；2026-09-29 当前目录未返回该型号，保留已核对档位，不视为当前可用性证明",
     "codex_protocol": "https://learn.chatgpt.com/docs/app-server#list-models-modellist",
     "luna": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
     "claude": "https://platform.claude.com/docs/en/build-with-claude/effort",
@@ -19,11 +20,17 @@
     "qwen": "https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-dashscope",
     "minimax": "https://platform.minimax.io/docs/api-reference/text-openai-api",
     "openai_astra": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+    "openai_sol_6": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "openai_luna_6": "https://developers.openai.com/api/docs/models/gpt-6-luna",
     "openai_sol": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
     "openai_terra": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
     "kimi_k3": "https://platform.kimi.ai/docs/guide/use-reasoning-effort",
     "kimi_k2": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-    "kimi_k27": "https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart"
+    "kimi_k27": "https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart",
+    "mimo_26_flash": "https://github.com/anomalyco/models.dev/blob/dev/providers/opencode-go/models/mimo-v2.6-flash.toml",
+    "mimo_26_pro": "https://github.com/anomalyco/models.dev/blob/dev/providers/opencode-go/models/mimo-v2.6-pro.toml",
+    "longcat_25_free": "https://github.com/anomalyco/models.dev/blob/dev/providers/opencode-go/models/longcat-2.5-preview-free.toml",
+    "space_bunny_free": "https://github.com/anomalyco/models.dev/blob/dev/providers/opencode-go/models/space-bunny-free.toml"
   },
   "entries": [
     {
@@ -45,22 +52,34 @@
       "note": "按官方目录快照收录到 xhigh，未将付费 Contributor 1.3 的用户反馈扩展到免费版或旧版本。API 另有 minimal，本 CLI 表不展示；默认不代表最高档。"
     },
     {
-      "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"],
+      "models": ["gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"],
       "levels": ["low", "medium", "high", "xhigh", "max", "ultra"],
-      "sources": ["codex_cli", "codex_protocol", "openai_astra", "openai_sol", "openai_terra"],
-      "note": "2026-09-14 Codex CLI 实测最高 ultra（自动任务委派）；官方直接 API 最高 max。ultra 是 Codex 能力，不保证 Claude CLI 或第三方网关支持。"
+      "sources": ["codex_cli", "codex_protocol", "openai_astra", "openai_sol_6", "openai_sol", "openai_terra"],
+      "note": "2026-09-29 Codex 桌面端 CLI 目录实测最高 ultra（自动任务委派）；官方直接 API 最高 max。ultra 是 Codex 能力，不保证 Claude CLI 或第三方网关支持。旧 npm CLI 尚未列出 GPT-6 Sol。"
     },
     {
-      "models": ["gpt-5.6-luna"],
+      "models": ["gpt-6-luna", "gpt-5.6-luna"],
       "levels": ["low", "medium", "high", "xhigh", "max"],
-      "sources": ["codex_cli", "luna"],
-      "note": "Luna 最高 max。API 文档另有 none，本机 CLI 模型菜单未列出，因此不作为 CLI 强度选项。"
+      "sources": ["codex_cli", "luna", "openai_luna_6"],
+      "note": "两代 Luna 最高 max，不支持 ultra。API 文档另有 none，本机 CLI 模型菜单未列出，因此不作为 CLI 强度选项；旧 npm CLI 尚未列出 GPT-6 Luna。"
     },
     {
-      "models": ["gpt-5.5", "gpt-5.2"],
+      "models": ["gpt-5.5"],
       "levels": ["low", "medium", "high", "xhigh"],
       "sources": ["codex_cli", "codex_protocol"],
       "note": "按本机 Codex CLI 能力快照维护，最高 xhigh。"
+    },
+    {
+      "models": ["gpt-5.2"],
+      "levels": ["low", "medium", "high", "xhigh"],
+      "sources": ["codex_cli_20260914", "codex_protocol"],
+      "note": "保留 2026-09-14 CLI 历史快照的 xhigh 上限；当前 CLI 目录不再列出该型号，不代表当前可调用。"
+    },
+    {
+      "models": ["claude-opus-5-5", "claude-sonnet-5-5"],
+      "levels": ["low", "medium", "high", "xhigh", "max"],
+      "sources": ["claude"],
+      "note": "2026-09-29 官方文档确认两款 5.5 均支持五档；Opus 5.5 默认 medium，Sonnet 5.5 默认 high。默认选项不主动覆盖供应商或 CLI 设置。"
     },
     {
       "models": ["claude-fable-5-1", "claude-fable-5", "claude-mythos-5-1", "claude-mythos-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5"],
@@ -123,10 +142,10 @@
       "note": "K2 系列资料未声明独立 effort 档位，保留默认；思考模式不等同于强度档位。"
     },
     {
-      "models": ["grok-4.6"],
+      "models": ["grok-4.7", "grok-4.6"],
       "levels": ["low", "medium", "high", "xhigh"],
       "sources": ["grok"],
-      "note": "Grok 4.6 四档有效强度，默认 high，最高 xhigh；不提供 max 或关闭思考。"
+      "note": "Grok 4.7 / 4.6 四档有效强度，默认 high，最高 xhigh；不提供 max 或关闭思考。"
     },
     {
       "models": ["grok-4.5"],
@@ -181,6 +200,18 @@
       "levels": [],
       "sources": ["go_catalog"],
       "note": "OpenCode 官方目录未声明离散 effort；LongCat 2.0 仅声明思考开关。保留默认，不假定 low/high/max 生效。"
+    },
+    {
+      "models": ["mimo-v2.6-flash", "mimo-v2.6-pro", "longcat-2.5-preview-free"],
+      "levels": [],
+      "sources": ["mimo_26_flash", "mimo_26_pro", "longcat_25_free"],
+      "note": "2026-09-29 OpenCode Go 目录未声明离散 effort；LongCat 2.5 Preview Free 只声明思考开关。保留默认，不把思考开关伪装为强度。"
+    },
+    {
+      "models": ["space-bunny-free"],
+      "levels": ["low", "medium", "high", "xhigh", "max"],
+      "sources": ["space_bunny_free"],
+      "note": "2026-09-29 OpenCode Go 目录声明五档，最高 max；仅适用这个匿名预览 ID，不推断其真实模型身份或免费活动可用性。"
     },
     {
       "models": ["omen-alpha"],

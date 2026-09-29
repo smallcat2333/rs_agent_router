@@ -56,7 +56,9 @@ Claude / Codex 优先读取 CC Switch 当前供应商，未配置时读取 CLI �
 
 OpenCode 首次选择时自动定位本机 npm 安装的 CLI；通过 `opencode models --verbose` 获取 `provider/model` 和原生 variant，不套用 Claude/Codex 强度表。使用 `run --format json`、stdin 提示词及 `--session` 续聊；认证沿用 CC Switch 写入的 OpenCode 配置。只读任务通过 `OPENCODE_PERMISSION` 拒绝编辑和 Bash，可编辑任务开放对应能力，不传 `--auto`。共享现有排队、取消及无输出超时；纯净启动与异常重试时限仍仅用于 Claude。原生错误直接回传，Token 用量来自 step_finish；未提供可靠流式耗时的 TPS 显示未知。执行模型通过本轮 messageID 对应的 `opencode export` 元数据确认，提交前缀为 `[ar-oc-provider-model-variant]`，缺少 variant 或身份时不猜测。
 
-强度表于 2026-09-14 按厂商文档、本机 Codex `model/list` 和 OpenCode 官方模型目录核对。Muse Spark 1.3 标准版最高 `max`，1.3 Contributor 根据用户当前渠道的回执与明确要求开放 `max`；Grok 4.6 最高 `xhigh`；Qwen 3.8 的有效档位为 `low/medium/xhigh`。API 的 `none/minimal`、思考开关、token 预算和同义映射不列为当前 CLI 的额外强度。Codex 的 `ultra` 包含自动任务委派，不能当作通用 API 档位；厂商能力与具体供应商支持范围可能不同，详见各模型 tooltip。菜单与参数验证不证明上游实际采用该强度。
+强度表最近于 2026-09-29 更新，新增 9 个明确型号：Grok 4.7 最高 `xhigh`；Claude Opus/Sonnet 5.5 支持 `low/medium/high/xhigh/max`，其中 Opus 5.5 官方默认 `medium`；GPT-6 Sol 在本机 Codex 桌面端 CLI 目录中最高 `ultra`，GPT-6 Luna 最高 `max`；Space Bunny Free 按 OpenCode Go 目录最高 `max`；MiMo 2.6 Flash/Pro、LongCat 2.5 Preview Free 未声明独立 effort，仅提供默认。来源链接保存在 `assets/model_efforts.json`；历史型号保留各自既有核对依据，最近维护日期不表示全表重新实测。本机 npm Codex 尚未列出 GPT-6 Sol/Luna，模型列表仍取用户所选 CLI，不自动替换 CLI 路径。
+
+Muse Spark 1.3 Contributor 保留用户当前渠道回执确认的 `max`，不扩展到免费版；Qwen 3.8 仍为 `low/medium/xhigh`。API 的 `none/minimal`、思考开关、token 预算和同义映射不列为当前 CLI 的额外强度。Codex 的 `ultra` 包含自动任务委派，不能当作通用 API 档位；厂商能力与具体供应商支持范围可能不同，详见各模型 tooltip。菜单与参数验证不证明上游实际采用该强度。
 
 每个新任务固定当时的 App 配置快照。已有任务的原生会话复用原快照，避免中途更换 CLI。Harness 请求不能包含 backend、model、effort、allow_edits、timeout_seconds。
 
@@ -284,3 +286,5 @@ AR 可托管 Desktop Commander Remote，将网页端的本机工具调用统一�
 2026-09-29 | 0.7.0 | 模型测试统一为 ModelTrace 三次数字挑战与内置 16 模型基准，移除旧连通性按钮、JSD 流程及手填基准入口；支持当前供应商的 Chat Completions、Responses、Anthropic Messages 传输，沿用同一归因与通过条件。23 项离线验证通过（含取消回收及三协议本地模拟），真实供应商与窗口交互待实测。
 
 2026-09-29 | 0.7.0 | 恢复统一 ModelTrace 时误删的普通“测试”按钮与 CLI 连通性任务，保留独立模型质量检测；4 项界面配置回归及 Release 构建通过，执行服务计时回归仍有失败，真实 CLI 点击待验收。
+
+2026-09-29 | 0.7.0 | 更新模型强度表，新增 Grok 4.7、Claude Opus/Sonnet 5.5、GPT-6 Sol/Luna、MiMo 2.6 Flash/Pro、LongCat 2.5 Preview Free、Space Bunny Free；保留 API 与 Codex ultra 的区别、历史来源及无独立强度模型边界，补充型号切换和 CLI 参数回归。

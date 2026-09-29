@@ -175,6 +175,12 @@ mod tests {
                 vec!["low", "medium", "high", "xhigh", "max"],
             ),
             ("grok-4.6", vec!["low", "medium", "high", "xhigh"]),
+            ("grok-4.7", vec!["low", "medium", "high", "xhigh"]),
+            ("gpt-6-sol", vec!["low", "medium", "high", "xhigh", "max", "ultra"]),
+            ("gpt-6-luna", vec!["low", "medium", "high", "xhigh", "max"]),
+            ("claude-opus-5-5", vec!["low", "medium", "high", "xhigh", "max"]),
+            ("claude-sonnet-5-5", vec!["low", "medium", "high", "xhigh", "max"]),
+            ("space-bunny-free", vec!["low", "medium", "high", "xhigh", "max"]),
             ("grok-4.5", vec!["low", "medium", "high"]),
             ("qwen3.8-flash", vec!["low", "medium", "xhigh"]),
             ("hy3", vec!["low", "high"]),
@@ -182,7 +188,8 @@ mod tests {
         ] {
             assert_eq!(lookup(Some(model)).unwrap().levels, levels, "{model}");
         }
-        for model in ["minimax-m3", "mimo-v2.5", "longcat-2.0", "qwen3.7-max"] {
+        for model in ["minimax-m3", "mimo-v2.5", "longcat-2.0", "qwen3.7-max",
+            "mimo-v2.6-flash", "mimo-v2.6-pro", "longcat-2.5-preview-free"] {
             let mut effort = Some("max".to_owned());
             normalize(Some(model), &mut effort);
             assert_eq!(effort, None, "{model}");
@@ -190,5 +197,45 @@ mod tests {
         }
         assert!(lookup(Some("muse-spark-1.30")).is_none());
         assert!(lookup(Some("grok-4.60")).is_none());
+        assert!(lookup(Some("grok-4.70")).is_none());
+        assert!(lookup(Some("claude-opus-5-50")).is_none());
+        assert!(lookup(Some("gpt-6-luna-preview")).is_none());
+    }
+
+    /// 新型号切换保留有效强度、清除越界档位；日期别名及 CLI 参数不丢失选择。
+    #[test]
+    fn recent_models_normalize_and_forward_effort() {
+        let mut effort = Some("ultra".into());
+        normalize(Some("gpt-6-sol"), &mut effort);
+        assert_eq!(effort.as_deref(), Some("ultra"));
+        normalize(Some("gpt-6-luna"), &mut effort);
+        assert_eq!(effort, None);
+        effort = Some("max".into());
+        normalize(Some("claude-opus-5-5-20260924[1m]"), &mut effort);
+        assert_eq!(effort.as_deref(), Some("max"));
+        normalize(Some("grok-4.7"), &mut effort);
+        assert_eq!(effort, None);
+
+        let mut record = crate::store::tests::sample("recent-effort");
+        for (backend, model, level, flag, argument) in [
+            (crate::protocol::Backend::Claude, "grok-4.7", "xhigh", "--effort", "xhigh"),
+            (crate::protocol::Backend::Claude, "claude-opus-5-5", "max", "--effort", "max"),
+            (crate::protocol::Backend::Codex, "gpt-6-sol", "ultra", "-c", "model_reasoning_effort=ultra"),
+            (crate::protocol::Backend::Codex, "gpt-6-luna", "max", "-c", "model_reasoning_effort=max"),
+        ] {
+            record.task.backend = backend;
+            record.task.model = Some(model.into());
+            record.task.effort = Some(level.into());
+            normalize(record.task.model.as_deref(), &mut record.task.effort);
+            assert_eq!(record.task.effort.as_deref(), Some(level));
+            let profile = crate::protocol::Profile {
+                program: Default::default(),
+                model: record.task.model.clone(),
+                effort: record.task.effort.clone(),
+            };
+            let args = crate::runner::arguments(&record.task, &profile);
+            assert!(args.windows(2).any(|pair| pair == [flag, argument]), "{model}");
+            assert!(args.windows(2).any(|pair| pair == ["--model", model]), "{model}");
+        }
     }
 }
