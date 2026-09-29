@@ -1,92 +1,130 @@
-// AR 私有 Node 子进程：凭据只从 stdin 接收，复用本机检测器采样与判定。
-import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+// AR 将固定版本的 ModelTrace 核心、挑战生成器与本文件组合为一个 Node 模块。
+// 基准库和私有 API 配置均从 stdin 接收，不依赖 npm 包或用户自建指纹。
 import { createInterface } from 'node:readline';
 
-/** 输出单行事件；只调用此入口发送经过筛选的结果，不输出端点或凭据。 */
-function emit(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+/** 事件仅包含进度和检测证据，不输出地址、密钥或上游错误正文。 */
+function emit(event) { process.stdout.write(`${JSON.stringify(event)}\n`); }
 
-/** OpenCode/provider 和基准的厂商前缀不参与匹配；版本后缀必须完全一致。 */
-export function modelId(value) { return value.split('/').at(-1); }
+/** 仅去除供应商命名空间；具体版本不作模糊归并。 */
+export function modelId(model) { return model.split('/').at(-1); }
 
-/** 同时核对有效采样、基准和真实响应 model；缺失回报不能当作通过。 */
-export function passed(result, model, reported) {
-  return result.verdict === 'match' && result.meanJsd !== null
-    && result.meanJsd <= 0.25 && result.comparison.comparableCellCount >= 4
-    && modelId(result.reference.model) === modelId(model)
-    && reported.length === 1 && modelId(reported[0]) === modelId(model);
+/** 三份有效回答完整归因后，所选、API 回报和识别结果一致即通过。 */
+export function verdict(analysis, expectedModel, reported) {
+  if (analysis.used_outputs !== 3) return 'insufficient';
+  if (reported.length !== 3 || reported.some(model => !model)) return 'missing_model';
+  if (reported.some(model => modelId(model) !== modelId(expectedModel))) return 'reported_mismatch';
+  return analysis.prediction === modelId(expectedModel) ? 'match' : 'mismatch';
 }
 
-/** 定位 npm link / 全局安装产物，不执行 npm 下载或修改检测器源码。 */
-function detectorPath() {
-  const folders = [process.env.APPDATA && join(process.env.APPDATA, 'npm'),
-    ...(process.env.PATH ?? '').split(';')].filter(Boolean);
-  const found = folders.map(folder => join(folder, 'node_modules', 'llm-fingerprint-detector', 'dist'))
-    .find(folder => existsSync(join(folder, 'index.js')));
-  if (!found) throw new Error('未找到 llm-fingerprint-detector；请安装并执行 npm link。');
-  return found;
+/** 按供应商声明的协议构造一个端点，不轮询或回退到另一套检测算法。 */
+export function completionUrl(baseUrl, protocol) {
+  const url = new URL(baseUrl);
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('供应商 API 地址格式不支持，请使用不含凭据或查询参数的 Base URL。');
+  }
+  const suffix = { chat: '/chat/completions', responses: '/responses', anthropic: '/messages' }[protocol];
+  if (!suffix) throw new Error('供应商 API 协议不支持。');
+  let path = url.pathname.replace(/\/+$/, '');
+  if (!path.endsWith(suffix)) {
+    // Messages 与上游 ModelTrace 一样补 /v1；OpenAI 保留已配置的路由前缀。
+    if (!path || (protocol === 'anthropic' && !path.endsWith('/v1'))) path += '/v1';
+    path += suffix;
+  }
+  url.pathname = path;
+  return url.href;
 }
 
-/** 每次进程只处理一份配置；先校验基准，再向所选供应商发送 quick 采样。 */
+/** 提取公开回答，排除思考块；截断、拒答与未完成响应不纳入指纹。 */
+export function completionText(payload, protocol) {
+  if (protocol === 'anthropic') {
+    if (payload.stop_reason !== 'end_turn') return '';
+    return (payload.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('');
+  }
+  if (protocol === 'responses') {
+    if (payload.status !== 'completed') return '';
+    return (payload.output ?? []).filter(item => item.type === 'message' && item.role === 'assistant')
+      .flatMap(item => item.content ?? []).filter(part => part.type === 'output_text')
+      .map(part => part.text).join('');
+  }
+  const choice = payload.choices?.[0];
+  if (choice?.finish_reason !== 'stop') return '';
+  const content = choice.message?.content;
+  return typeof content === 'string' ? content
+    : Array.isArray(content) ? content.filter(part => part.type === 'text').map(part => part.text).join('') : '';
+}
+
+/** 三种传输协议共用同一套 ModelTrace 挑战；保持默认采样参数且禁用工具。 */
+export function requestBody(endpoint, prompt) {
+  if (endpoint.protocol === 'responses') {
+    return { model: endpoint.model, input: [{ role: 'user', content: prompt }], stream: false, store: false };
+  }
+  const body = { model: endpoint.model, messages: [{ role: 'user', content: prompt }], stream: false };
+  if (endpoint.protocol === 'anthropic') body.max_tokens = 4096;
+  return body;
+}
+
+/** 单次 API 调用有界等待；只返回正文和真实响应模型，错误不携带供应商正文。 */
+async function sample(endpoint, prompt, signal) {
+  const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+  if (endpoint.protocol === 'anthropic') {
+    headers['anthropic-version'] = '2023-06-01';
+    if (endpoint.authType === 'bearer') headers.Authorization = `Bearer ${endpoint.apiKey}`;
+    else headers['x-api-key'] = endpoint.apiKey;
+  } else { headers.Authorization = `Bearer ${endpoint.apiKey}`; }
+  let response;
+  try {
+    response = await fetch(completionUrl(endpoint.baseUrl, endpoint.protocol), {
+      method: 'POST', headers, body: JSON.stringify(requestBody(endpoint, prompt)),
+      signal, redirect: 'error',
+    });
+  } catch {
+    throw new Error(signal.aborted ? '检测超时。' : 'API 连接失败，请检查地址、协议与网络。');
+  }
+  if (!response.ok) {
+    throw new Error([401, 403].includes(response.status) ? 'API 鉴权失败，请检查所选供应商的密钥。'
+      : `API 请求失败（HTTP ${response.status}），请检查所选模型与接口协议。`);
+  }
+  let payload;
+  try { payload = await response.json(); }
+  catch { throw new Error('API 未返回有效 JSON，请检查接口协议。'); }
+  return { text: completionText(payload, endpoint.protocol),
+    model: typeof payload.model === 'string' ? payload.model.trim() : '' };
+}
+
+/** 验证覆盖后执行三个独立挑战；不会用其它模型基准补位。 */
 async function main() {
   const reader = createInterface({ input: process.stdin });
   let input;
   for await (const line of reader) { input = JSON.parse(line); break; }
   reader.close();
-  const folder = detectorPath();
-  const { verify } = await import(pathToFileURL(join(folder, 'index.js')).href);
-  const { listBundledReferences, loadBundledReference, parseFingerprintJson } =
-    await import(pathToFileURL(join(folder, 'reference.js')).href);
-  let reference;
-  if (input.reference) {
-    try { reference = parseFingerprintJson(readFileSync(input.reference, 'utf8')); }
-    catch { throw new Error('基准 JSON 无法读取或格式无效。'); }
-  } else {
-    const refs = listBundledReferences().filter(ref => modelId(ref.model) === modelId(input.model));
-    if (refs.length !== 1) throw new Error(`无唯一对应基准：${input.model}。请填写该模型的可信基准 JSON。`);
-    reference = loadBundledReference(refs[0].id);
+  const bank = input.bank;
+  const expected = input.endpoint?.model ?? input.model;
+  if (!bank.models.some(model => model.id === modelId(expected))) {
+    throw new Error(`内置 ModelTrace 基准尚未收录 ${expected}，无法检测。`);
   }
-  if (modelId(reference.model) !== modelId(input.model)) throw new Error('基准模型与所选模型不一致。');
   if (!input.endpoint) throw new Error(input.endpointError);
-  // 只读取本次检测器请求的响应 metadata；检测器自身的 fingerprint.model 是请求值。
-  const reported = new Set();
-  let missingModel = false;
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (...args) => {
-    const response = await originalFetch(...args);
-    if (response.ok) {
-      const data = await response.clone().json();
-      if (typeof data.model === 'string' && data.model.trim()) reported.add(data.model.trim());
-      else missingModel = true;
-    }
-    return response;
-  };
-  let result;
-  try {
-    result = await verify(input.endpoint, reference, {
-      cells: 4, samplesPerCell: 15, timeoutMs: 30000, maxRetries: 1,
-      signal: AbortSignal.timeout(180000),
-      onProgress: event => emit({ type: 'progress', stage: event.stage, done: event.done, total: event.total }),
-    });
-  } catch (error) {
-    // HTTP 错误可能含供应商原始 body；绝不把它带入日志或界面。
-    const reason = error?.reason ?? error?.kind;
-    throw new Error(reason === 'auth' ? 'API 鉴权失败，请检查当前供应商密钥。'
-      : reason === 'aborted' ? '检测超时或已取消。'
-      : 'API 检测失败；请确认供应商支持 /chat/completions、网络可达且模型可用。');
-  } finally { globalThis.fetch = originalFetch; }
-  const models = [...reported];
-  emit({ type: 'result', passed: !missingModel && passed(result, input.model, models),
-    model: input.model, reported: models, missingModel, reference: result.reference.model,
-    verdict: result.verdict, meanJsd: result.meanJsd,
-    comparableCells: result.comparison.comparableCellCount,
-    protocolMismatch: result.comparison.protocolMismatch,
-    postReasoning: result.target.fingerprint.postReasoning,
-    errors: result.target.errorCount });
+  const outputs = [], reported = [];
+  const challenges = generateChallenges(3);
+  const signal = AbortSignal.timeout(360000);
+  for (const [index, challenge] of challenges.entries()) {
+    emit({ type: 'progress', done: index, total: 3 });
+    const reply = await sample(input.endpoint, challenge.prompt, signal);
+    outputs.push({ text: reply.text, expected_count: challenge.expected_count });
+    reported.push(reply.model);
+    emit({ type: 'progress', done: index + 1, total: 3 });
+  }
+  // 与上游使用完全相同的有效样本门槛；不足三份时不作通过判定。
+  const valid = outputs.filter(output => parseNumbers(output.text).length >= Math.max(80, Math.ceil(output.expected_count * 0.55)));
+  const analysis = valid.length ? analyzeGlobalOutputs(outputs, bank) : { used_outputs: 0, prediction: '', probability: null, results: [] };
+  const state = verdict(analysis, expected, reported);
+  emit({ type: 'result', verdict: state, model: input.model, apiModel: expected,
+    reported: [...new Set(reported.filter(Boolean))], prediction: analysis.used_outputs === 3 ? analysis.prediction : '',
+    probability: analysis.used_outputs === 3 ? analysis.probability : null,
+    usedOutputs: analysis.used_outputs, bankDate: bank.built_at,
+    candidates: analysis.used_outputs === 3 ? analysis.results.slice(0, 3).map(item => ({ model: item.model, probability: item.probability })) : [] });
 }
 
-// 被单元测试导入时不读取 stdin；AR 以 node --input-type=module -e 启动。
+// 测试可导入纯函数；AR 的组合模块才读取 stdin 并发送请求。
 if (process.argv.includes('--ar-model-quality')) {
   main().catch(error => { emit({ type: 'error', message: error.message }); process.exitCode = 1; });
 }

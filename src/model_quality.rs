@@ -22,13 +22,13 @@ impl Drop for Run {
     fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); }
 }
 
-/// 固定所选 CLI、模型和基准文件快照，后台读取供应商配置并运行一次 quick 检测。
-pub fn start(backend: Backend, model: String, reference: String) -> Run {
+/// 固定所选 CLI 和模型快照，使用内置 ModelTrace 基准完成三次独立挑战。
+pub fn start(backend: Backend, model: String) -> Run {
     let (tx, updates) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = stop.clone();
     std::thread::spawn(move || {
-        if let Err(error) = execute(backend, &model, &reference, &worker_stop, &tx) {
+        if let Err(error) = execute(backend, &model, &worker_stop, &tx) {
             let _ = tx.send(Update { text: format!("无法检测：{error}"), finished: true });
         }
     });
@@ -82,11 +82,14 @@ fn endpoint_from_settings(backend: Backend, model: &str, settings: &Value) -> Re
     match backend {
         Backend::Claude => {
             let env = &settings["env"];
-            let base = required(env, "ANTHROPIC_BASE_URL", "Claude 未配置兼容 API 地址")?;
+            let base = env["ANTHROPIC_BASE_URL"].as_str().unwrap_or("https://api.anthropic.com/v1");
             let key = env["ANTHROPIC_AUTH_TOKEN"].as_str().filter(|s| !s.is_empty())
                 .or_else(|| env["ANTHROPIC_API_KEY"].as_str().filter(|s| !s.is_empty()))
                 .context("Claude 当前供应商没有 API Key")?;
-            Ok(json!({"baseUrl":base,"apiKey":key,"model":model}))
+            let auth_type = if env["ANTHROPIC_AUTH_TOKEN"].as_str().is_some_and(|s| !s.is_empty()) {
+                "bearer"
+            } else { "api_key" };
+            Ok(json!({"baseUrl":base,"apiKey":key,"model":model,"protocol":"anthropic","authType":auth_type}))
         }
         Backend::Codex => {
             let text = required(settings, "config", "Codex 缺少供应商配置")?;
@@ -106,7 +109,9 @@ fn endpoint_from_settings(backend: Backend, model: &str, settings: &Value) -> Re
                 required(&settings["auth"], "OPENAI_API_KEY", "Codex 当前配置没有 API Key；订阅登录不能用于此检测")?.to_owned()
             };
             ensure!(!key.trim().is_empty(), "Codex API Key 为空");
-            Ok(json!({"baseUrl":base,"apiKey":key,"model":model}))
+            let protocol = provider.and_then(|p| p.get("wire_api")).and_then(toml::Value::as_str).unwrap_or("responses");
+            ensure!(matches!(protocol, "responses" | "chat"), "不支持当前 Codex wire_api 协议");
+            Ok(json!({"baseUrl":base,"apiKey":key,"model":model,"protocol":protocol}))
         }
         Backend::Opencode => {
             let (provider, api_model) = model.split_once('/').context("OpenCode 模型缺少供应商前缀")?;
@@ -121,7 +126,13 @@ fn endpoint_from_settings(backend: Backend, model: &str, settings: &Value) -> Re
                 key.to_owned()
             };
             let api_model = definition["models"][api_model]["id"].as_str().unwrap_or(api_model);
-            Ok(json!({"baseUrl":base,"apiKey":key,"model":api_model}))
+            let protocol = match definition["npm"].as_str() {
+                Some("@ai-sdk/anthropic") => "anthropic",
+                Some("@ai-sdk/openai") => "responses",
+                Some("@ai-sdk/openai-compatible") => "chat",
+                _ => bail!("所选 OpenCode 供应商未声明受支持的 API 协议"),
+            };
+            Ok(json!({"baseUrl":base,"apiKey":key,"model":api_model,"protocol":protocol,"authType":"api_key"}))
         }
         Backend::Agy => bail!("Antigravity 使用 CLI 登录，没有 OpenAI 兼容 API 配置"),
     }
@@ -140,12 +151,12 @@ fn endpoint(backend: Backend, model: &str) -> Result<Value> {
 }
 
 /// Node 通过 stdin 接收私有配置；取消和总超时均终止进程树，stderr 不回显。
-fn execute(backend: Backend, model: &str, reference: &str, stop: &AtomicBool, tx: &mpsc::Sender<Update>) -> Result<()> {
+fn execute(backend: Backend, model: &str, stop: &AtomicBool, tx: &mpsc::Sender<Update>) -> Result<()> {
     ensure!(!model.trim().is_empty(), "请先选择具体模型，CLI 默认无法确定检测对象");
     let endpoint = endpoint(backend, model);
     let input = match endpoint {
-        Ok(endpoint) => json!({"model":model,"reference":reference,"endpoint":endpoint}),
-        Err(error) => json!({"model":model,"reference":reference,"endpointError":error.to_string()}),
+        Ok(endpoint) => json!({"model":model,"endpoint":endpoint}),
+        Err(error) => json!({"model":model,"endpointError":error.to_string()}),
     };
     run_detector(&input, stop, tx)
 }
@@ -153,14 +164,20 @@ fn execute(backend: Backend, model: &str, reference: &str, stop: &AtomicBool, tx
 /// 独立的进程传输入口，允许离线验证 Rust → Node 的参数、管道和结束事件。
 fn run_detector(input: &Value, stop: &AtomicBool, tx: &mpsc::Sender<Update>) -> Result<()> {
     ensure!(!stop.load(Ordering::Relaxed), "已取消");
+    let script = [include_str!("../vendor/modeltrace/fingerprint-core.mjs"),
+        include_str!("../vendor/modeltrace/challenge-browser.mjs"),
+        include_str!("../assets/model-quality.mjs")].join("\n");
+    let mut input = input.clone();
+    input["bank"] = serde_json::from_str(include_str!("../vendor/modeltrace/unified_bank.json"))
+        .context("内置 ModelTrace 基准无效")?;
     let (process, events) = cli_stream::Command::new("node")
-        .args(["--input-type=module", "-e", include_str!("../assets/model-quality.mjs"), "--", "--ar-model-quality"])
+        .args(["--input-type=module", "-e", script.as_str(), "--", "--ar-model-quality"])
         .stdin(cli_stream::Stdin::Piped).stderr(cli_stream::Stderr::Discarded)
-        .timeout(Duration::from_secs(195)).start().context("无法启动 Node.js，请检查安装和 PATH")?;
+        .timeout(Duration::from_secs(375)).start().context("无法启动 Node.js，请检查安装和 PATH")?;
     let result = (|| {
         process.write_line(&input.to_string())?;
         process.close_stdin()?;
-        let deadline = Instant::now() + Duration::from_secs(190);
+        let deadline = Instant::now() + Duration::from_secs(370);
         let mut terminal = None;
         loop {
             ensure!(!stop.load(Ordering::Relaxed), "已取消");
@@ -170,8 +187,7 @@ fn run_detector(input: &Value, stop: &AtomicBool, tx: &mpsc::Sender<Update>) -> 
                     let event: Value = serde_json::from_str(&line).context("检测器返回无效事件")?;
                     match event["type"].as_str() {
                         Some("progress") => { let _ = tx.send(Update {
-                            text: if event["stage"] == "adapter" { "正在探测采样参数…".into() }
-                                else { format!("采样中：{} / {}", event["done"], event["total"]) }, finished: false }); },
+                            text: format!("数字挑战：已完成 {} / {}", event["done"], event["total"]), finished: false }); },
                         Some("error") => terminal = Some(format!("无法检测：{}", event["message"].as_str().context("错误事件缺少信息")?)),
                         Some("result") => terminal = Some(report(&event)?),
                         _ => bail!("检测器返回未知事件"),
@@ -193,23 +209,30 @@ fn run_detector(input: &Value, stop: &AtomicBool, tx: &mpsc::Sender<Update>) -> 
     result
 }
 
-/// 展示检测证据，保留样本不足和协议差异；供应商自报身份本身不能判通过。
+/// 展示唯一的 ModelTrace 结论；库内归因概率不等同于模型身份的真实性概率。
 fn report(event: &Value) -> Result<String> {
     let verdict = required(event, "verdict", "检测结果缺少 verdict")?;
-    let passed = event["passed"].as_bool().context("检测结果缺少通过状态")?;
-    let conclusion = if passed { "通过：指纹匹配，API 回报模型一致" } else {
-        match verdict { "match" => "未通过：指纹匹配，但 API 回报模型缺失或不一致",
-            "mismatch" => "未通过：模型指纹不匹配", "uncertain" => "不确定：JSD 处于灰度区",
-            "insufficient" => "无法判定：有效样本不足", _ => bail!("未知检测结论") }
+    let conclusion = match verdict {
+        "match" => "通过：识别结果与所选模型、API 回报一致",
+        "mismatch" => "未通过：识别模型与 API 回报不一致",
+        "reported_mismatch" => "未通过：API 回报与所选模型不一致",
+        "missing_model" => "无法判定：API 未完整回报模型名称",
+        "insufficient" => "无法判定：未取得三份有效回答",
+        _ => bail!("未知检测结论"),
     };
     let reported = event["reported"].as_array().context("检测结果缺少回报模型")?
         .iter().filter_map(Value::as_str).collect::<Vec<_>>().join("、");
-    let jsd = event["meanJsd"].as_f64().map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into());
-    let mut text = format!("{conclusion}\n所选模型：{}\nAPI 回报：{}\n基准模型：{}\nJSD：{jsd} · 可比维度：{} · 失败请求：{}",
-        required(event, "model", "缺少所选模型")?, if reported.is_empty() { "未提供" } else { &reported },
-        required(event, "reference", "缺少基准模型")?, event["comparableCells"], event["errors"]);
-    if event["protocolMismatch"] == true { text.push_str("\n提示：内置基准与本次采样协议不同，结论仅供初筛。"); }
-    if event["postReasoning"] == true { text.push_str("\n提示：无法关闭推理，指纹置信度降低。"); }
+    let probability = event["probability"].as_f64().map(|v| format!("{:.1}%", v * 100.)).unwrap_or_else(|| "—".into());
+    let prediction = event["prediction"].as_str().filter(|s| !s.is_empty()).unwrap_or("—");
+    let mut text = format!("{conclusion}\n所选模型：{}\nAPI 请求模型：{}\nAPI 回报：{}\n识别模型：{prediction}\n库内归因概率：{probability} · 有效回答：{} / 3\n基准版本：{}",
+        required(event, "model", "缺少所选模型")?, required(event, "apiModel", "缺少 API 请求模型")?,
+        if reported.is_empty() { "未提供" } else { &reported }, event["usedOutputs"],
+        required(event, "bankDate", "缺少基准版本")?);
+    for candidate in event["candidates"].as_array().context("缺少候选结果")? {
+        text.push_str(&format!("\n  {}：{:.1}%", required(candidate, "model", "候选缺少模型")?,
+            candidate["probability"].as_f64().context("候选缺少概率")? * 100.));
+    }
+    text.push_str("\n结果为现有基准库内的行为归因，仅供参考。");
     Ok(text)
 }
 
@@ -224,6 +247,8 @@ mod tests {
             "ANTHROPIC_BASE_URL":"https://example.invalid/v1", "ANTHROPIC_AUTH_TOKEN":"test-key"}})).unwrap();
         assert_eq!(endpoint["model"], "claude-sonnet-4.5");
         assert_eq!(endpoint["baseUrl"], "https://example.invalid/v1");
+        assert_eq!(endpoint["protocol"], "anthropic");
+        assert_eq!(endpoint["authType"], "bearer");
     }
 
     /// 不提取订阅登录 token；无 API Key 时明确失败。
@@ -242,6 +267,7 @@ mod tests {
             "auth":{"OPENAI_API_KEY":"private-test"}});
         let endpoint = endpoint_from_settings(Backend::Codex, "gpt-4o", &settings).unwrap();
         assert_eq!(endpoint["baseUrl"], "https://example.invalid/v1");
+        assert_eq!(endpoint["protocol"], "responses");
         let error = endpoint_from_settings(Backend::Codex, "gpt-4o", &json!({"config":"private-test=["})).unwrap_err();
         assert!(!error.to_string().contains("private-test"));
     }
@@ -250,21 +276,62 @@ mod tests {
     #[test]
     fn opencode_selects_provider_and_model_mapping() {
         let endpoint = endpoint_from_settings(Backend::Opencode, "custom/alias", &json!({"provider":{
-            "custom":{"options":{"baseURL":"https://example.invalid/v1","apiKey":"test-key"},
+            "custom":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"https://example.invalid/v1","apiKey":"test-key"},
                 "models":{"alias":{"id":"gpt-4o"}}}}})).unwrap();
         assert_eq!(endpoint["model"], "gpt-4o");
+        assert_eq!(endpoint["protocol"], "chat");
         assert!(endpoint_from_settings(Backend::Opencode, "other/alias", &json!({})).is_err());
     }
 
     /// 使用本机 Node 和检测器验证私有 stdin 及 JSONL，不读取用户配置或发送 API 请求。
     #[test]
-    #[ignore = "requires Node.js and npm-linked llm-fingerprint-detector"]
+    #[ignore = "requires Node.js"]
     fn node_bridge_roundtrip_without_api() {
         let (tx, rx) = mpsc::channel();
-        run_detector(&json!({"model":"gpt-4o","reference":"","endpointError":"fixture-no-api"}),
+        run_detector(&json!({"model":"gpt-6-astra","endpointError":"fixture-no-api"}),
             &AtomicBool::new(false), &tx).unwrap();
         let update = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(update.finished);
         assert_eq!(update.text, "无法检测：fixture-no-api");
+    }
+
+    /// 本地 API 保持请求未返回时取消，验证 Rust 会及时回收正在等待网络的 Node 进程。
+    #[test]
+    #[ignore = "requires Node.js"]
+    fn node_cancellation_reclaims_waiting_process() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let input = json!({"model":"gpt-6-astra","endpoint":{
+            "model":"gpt-6-astra", "protocol":"chat", "apiKey":"fixture-key",
+            "baseUrl":format!("http://{}/v1", server.server_addr())}});
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (tx, _rx) = mpsc::channel();
+            let result = run_detector(&input, &worker_stop, &tx);
+            let _ = done_tx.send(result);
+        });
+        let request = server.recv_timeout(Duration::from_secs(30)).unwrap().expect("Node 未发出挑战请求");
+        stop.store(true, Ordering::Relaxed);
+        let error = done_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "已取消");
+        drop(request);
+        worker.join().unwrap();
+    }
+
+    /// UI 使用同一结论枚举，样本不足时不会显示通过或保留旧 JSD 字段。
+    #[test]
+    fn result_text_distinguishes_incomplete_and_match() {
+        let mut event = json!({"verdict":"insufficient","model":"gpt-6-astra","apiModel":"gpt-6-astra",
+            "reported":["gpt-6-astra"],"prediction":"","probability":null,
+            "usedOutputs":2,"bankDate":"2026-09-23","candidates":[]});
+        let text = report(&event).unwrap();
+        assert!(text.starts_with("无法判定"));
+        assert!(!text.contains("JSD"));
+        event["verdict"] = json!("match");
+        event["prediction"] = json!("gpt-6-astra");
+        event["probability"] = json!(0.9);
+        event["usedOutputs"] = json!(3);
+        assert!(report(&event).unwrap().starts_with("通过"));
     }
 }

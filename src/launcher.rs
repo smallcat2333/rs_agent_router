@@ -114,7 +114,6 @@ struct Dashboard {
     model_refresh: Option<mpsc::Receiver<Result<crate::opencode::Catalog, String>>>,
     quality_open: bool,
     quality_selection: Option<(Backend, String)>,
-    quality_reference: String,
     quality_status: String,
     quality_run: Option<crate::model_quality::Run>,
     selected: Option<String>,
@@ -160,7 +159,7 @@ impl Dashboard {
     fn start_quality_test(&mut self) {
         let Some((backend, model)) = self.quality_selection.clone() else { return; };
         self.quality_status = "正在读取供应商配置与基准…".into();
-        self.quality_run = Some(crate::model_quality::start(backend, model, self.quality_reference.trim().to_owned()));
+        self.quality_run = Some(crate::model_quality::start(backend, model));
     }
 
     /// 非阻塞接收检测进度；关闭窗口保留检测，取消或退出时回收专属进程。
@@ -189,12 +188,8 @@ impl Dashboard {
             if let Some((backend, model)) = &self.quality_selection {
                 ui.label(format!("检测对象：{} / {model}", backend.key()));
             }
-            ui.label("直接检测供应商 API · quick：4 维度 × 15 次采样，另含参数探测请求");
-            ui.add_enabled_ui(self.quality_run.is_none(), |ui| {
-                ui.label("基准 JSON（留空自动匹配内置基准）");
-                ui.add(egui::TextEdit::singleline(&mut self.quality_reference).desired_width(f32::INFINITY)
-                    .hint_text("该模型在可信端点录制的指纹文件完整路径"));
-            });
+            ui.label("三次独立数字挑战 · 自动使用内置 ModelTrace 基准");
+            ui.label("识别模型与 API 回报、所选模型一致即通过；无需填写指纹文件。");
             ui.horizontal(|ui| {
                 if ui.add_enabled(self.quality_run.is_none() && self.quality_selection.is_some(), egui::Button::new("重新测试")).clicked() {
                     self.start_quality_test();
@@ -492,20 +487,6 @@ impl Dashboard {
             );
         });
     }
-    /// 通过正常 Harness 工作契约提交测试，继承所选执行快照且独立留痕归档。
-    fn test_model(&mut self, now: i64) -> Result<()> {
-        let mut manager = self.manager.lock().unwrap();
-        let work = crate::protocol::Work {
-            task_id: format!("model-test-{}", uuid::Uuid::new_v4()),
-            title: Some(format!("模型测试 · {}", self.editing_profiles[self.preferences.backend.key()].model.as_deref().unwrap_or("CLI 默认"))),
-            group_path: vec!["模型测试".into(), "rs_agent_router".into(), "连通性测试".into()],
-            workdir: manager.root.clone(),
-            prompt: "这是 Harness 发起的模型连通性测试。请只回复 ROUTER_MODEL_OK，不调用工具，不读取或修改文件。".into(),
-        };
-        manager.submit(work, now)?;
-        self.archived = false;
-        Ok(())
-    }
     /// 加载选中任务详情，不改变任务活动时间；日志显示尾部，完整文件仍保留。
     fn load_detail(&mut self) {
         let manager = self.manager.lock().unwrap();
@@ -607,7 +588,6 @@ impl eframe::App for Dashboard {
         };
         let mut actions = Vec::new();
         let mut refresh_models = false;
-        let mut test_model = false;
         let mut quality_test = false;
         let (records, running, shutting, error) = {
             let m = self.manager.lock().unwrap();
@@ -771,12 +751,8 @@ impl eframe::App for Dashboard {
                                 )
                                 .on_hover_text("Claude 重读 CC Switch；Codex / OpenCode / Antigravity 查询各自 CLI 的可选模型列表")
                                 .clicked();
-                            test_model = ui
-                                .add_enabled(!shutting, egui::Button::new("测试"))
-                                .on_hover_text("用所选配置提交一次模型测试任务")
-                                .clicked();
                             quality_test = ui.add_enabled(!shutting, egui::Button::new("模型质量测试"))
-                                .on_hover_text("直接采样当前供应商 API；指纹匹配且 API 回报模型一致才通过")
+                                .on_hover_text("三次数字挑战；ModelTrace 识别结果与所选模型、API 回报一致才通过")
                                 .clicked();
                             ui.add_space(8.);
                             if self.preferences.backend != Backend::Opencode {
@@ -929,18 +905,11 @@ impl eframe::App for Dashboard {
                 if refresh_models || self.model_backend != self.preferences.backend {
                     self.refresh_models();
                 }
-                if test_model {
-                    self.error = match self.save_settings().and_then(|_| self.test_model(now)) {
-                        Ok(()) => String::new(),
-                        Err(error) => format!("模型测试启动失败：{error:#}"),
-                    };
-                }
                 if quality_test {
                     self.quality_open = true;
                     if self.quality_run.is_none() {
                         self.quality_selection = self.editing_profiles[self.preferences.backend.key()].model.clone()
                             .map(|model| (self.preferences.backend, model));
-                        self.quality_reference.clear();
                         if self.quality_selection.is_some() { self.start_quality_test(); }
                         else { self.quality_status = "请先选择具体模型，CLI 默认无法确定检测对象".into(); }
                     }
@@ -1382,7 +1351,6 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
                 model_refresh: None,
                 quality_open: false,
                 quality_selection: None,
-                quality_reference: String::new(),
                 quality_status: String::new(),
                 quality_run: None,
                 archived: preferences.archived,

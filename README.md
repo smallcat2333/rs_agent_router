@@ -42,13 +42,17 @@ Harness 只分配工作，Rust App 决定执行 CLI、模型、强度、权限�
 
 在 RustRover 直接 Run 打开管理页，选择 **Claude / Codex / OpenCode CLI**，填写模型和强度。设置修改后自动保存并用于后续任务，无需额外点击保存；已运行任务保留原快照。GLM 是模型名称，不是独立 CLI。
 
-模型下拉框支持刷新：Claude 读取 CC Switch 当前供应商配置，Codex 在后台查询所选 CLI 的模型目录；“测试”按当前配置创建独立的“模型测试”分组任务。强度按 `assets/model_efforts.json` 的本地维护表显示，含资料来源和核对日期，不随刷新联网查询；切换模型时不支持的旧档位恢复默认。Claude 使用 `--effort`，Codex 使用 `model_reasoning_effort`；“默认”表示不覆盖原 CLI 默认值。超时默认 300 秒，归档默认 4h，顶部设置修改后自动记忆。
+模型下拉框支持刷新：Claude 读取 CC Switch 当前供应商配置，Codex 在后台查询所选 CLI 的模型目录。强度按 `assets/model_efforts.json` 的本地维护表显示，含资料来源和核对日期，不随刷新联网查询；切换模型时不支持的旧档位恢复默认。Claude 使用 `--effort`，Codex 使用 `model_reasoning_effort`；“默认”表示不覆盖原 CLI 默认值。超时默认 300 秒，归档默认 4h，顶部设置修改后自动记忆。
 
-“模型质量测试”固定点击时所选模型，直接向对应供应商的 OpenAI 兼容 `/chat/completions` API 采样。需要本机 Node.js 与已编译、通过 `npm link` 注册的 `llm-fingerprint-detector`；不经过 CLI 对话。Claude / Codex 优先读取 CC Switch 当前供应商，未配置时读取 CLI 配置；OpenCode 按所选 `provider/model` 读取本地 `opencode.json`（支持 `OPENCODE_CONFIG`），使用 `options.baseURL/apiKey`，支持密钥环境变量引用。订阅登录、Antigravity、仅提供 Anthropic Messages / OpenAI Responses 的端点不能直接使用此检测。
+“模型质量测试”是唯一模型测试入口，固定点击时所选模型，直接检测对应供应商 API。流程统一为：读取供应商配置 → 使用内置 ModelTrace 基准 → 三次独立数字挑战 → 指纹归因 → 核对识别模型、API 回报和所选模型。旧连通性测试按钮、JSD 检测和手填基准 JSON 已移除，不保留算法切换或旧检测器回退。
 
-按钮默认执行 quick（4 维度 × 15 次，另有参数探测请求），后台显示进度，支持取消，总时限约 190 秒。自动寻找唯一同名内置基准；缺少时可在结果窗口填写可信端点录制的基准 JSON 并重新测试。只有指纹 `MATCH`（JSD ≤ 0.25，至少 4 个可比维度）、基准模型与所选模型相符、全部成功响应的 `model` 非空且一致时显示“通过”；灰度区、指纹不匹配、样本不足或回报模型不同均不算通过。比较时忽略供应商前缀，版本后缀必须一致。结果展示 API 真实回报模型，不能用检测器回显的请求模型代替。内置基准协议差异和推理降级会单独提示，统计匹配用于初筛。密钥仅经子进程 stdin 传入，不进入命令行、结果或 AR 配置。界面结果保留在本次运行内。
+算法、挑战生成器和 2026-09-23 的 16 模型基准随 EXE 内置（含 GPT-6 Astra/Sol/Luna），不需要用户采集基准或安装检测器包；运行需要 Node.js 20+。上游固定提交和许可证见 `THIRD_PARTY_NOTICES.md`。每次测试执行三条独立请求，每条要求约 300 个整数；只有三份回答全部有效、最高归因模型与 API 实际回报及请求模型一致才显示通过。缺失回报、模型不同或拒答/截断造成样本不足均不算通过；未收录模型在发请求前停止。OpenCode 模型别名按其显式 API ID 比较，供应商前缀可省略，版本后缀必须一致。结果展示前 3 个候选及库内归因概率；该概率只描述现有候选之间的相对归因，不是身份真实性证明。
 
-离线验证：`cargo test --offline model_quality` 与 `node --test tests/model-quality.test.mjs`；后者使用本地模拟 API，不调用真实供应商、不消耗账号额度。
+Claude / Codex 优先读取 CC Switch 当前供应商，未配置时读取 CLI 配置；Claude 使用 Anthropic Messages，Codex 遵从供应商 `wire_api`（默认 Responses）。OpenCode 按所选 `provider/model` 读取本地 `opencode.json`（支持 `OPENCODE_CONFIG`），读取 `options.baseURL/apiKey` 与显式模型 ID；支持密钥环境变量引用，按 `npm` 选择 Anthropic、OpenAI Responses 或 Chat Completions 传输协议。三种协议共用同一算法，不自动试探其它接口。订阅/OAuth 登录或 Antigravity 没有可用 API Key 时明确显示无法检测，不提取订阅令牌。检测不经过 CLI，不沿用 CLI 的对话、工具或推理档位。
+
+后台显示三次挑战进度，支持取消，总时限约 370 秒。密钥和基准经私有 stdin 传入 Node，不写命令行、结果或 AR 配置；HTTP 错误正文不回显。结果保留在本次运行内，切换顶部模型不会改变正在检测的对象。
+
+离线验证：`cargo test --offline model_quality`、`cargo test --offline node_bridge_roundtrip_without_api -- --ignored` 与 `node --test tests/model-quality.test.mjs`。覆盖固定上游样本的算法回归、三种协议的本地模拟 API、身份不一致和样本不足等；不调用真实供应商、不消耗账号额度。
 
 OpenCode 首次选择时自动定位本机 npm 安装的 CLI；通过 `opencode models --verbose` 获取 `provider/model` 和原生 variant，不套用 Claude/Codex 强度表。使用 `run --format json`、stdin 提示词及 `--session` 续聊；认证沿用 CC Switch 写入的 OpenCode 配置。只读任务通过 `OPENCODE_PERMISSION` 拒绝编辑和 Bash，可编辑任务开放对应能力，不传 `--auto`。共享现有排队、取消及无输出超时；纯净启动与异常重试时限仍仅用于 Claude。原生错误直接回传，Token 用量来自 step_finish；未提供可靠流式耗时的 TPS 显示未知。执行模型通过本轮 messageID 对应的 `opencode export` 元数据确认，提交前缀为 `[ar-oc-provider-model-variant]`，缺少 variant 或身份时不猜测。
 
@@ -276,3 +280,5 @@ AR 可托管 Desktop Commander Remote，将网页端的本机工具调用统一�
 2026-09-16 | 0.6.0 | 修复 Desktop Commander 0.2.50 分段读取文件后遗留句柄，导致 Qt Designer 替换保存失败的问题：AR 启动 DCR 时加载限定于其文本读取模块的流清理修复，并传递到 MCP 子进程，读取返回前等待文件关闭。不修改 npm 缓存、系统环境或用户设计文件；已有 DCR 进程不会被自动重启，修复在新版 AR 下次启动 DCR 时生效，不能回收旧进程已泄漏的句柄。可用 `node --test tests/dcr-read-stream-guard.cjs` 验证提前结束、完整读取、异常/取消和子进程传播；已用实际安装包及临时文件验证 Qt QSaveFile 替换保存成功。
 
 2026-09-28 | 0.7.0 | 新增模型质量测试按钮，直接检测所选供应商 API，结合指纹与真实响应模型判定；支持进度、取消及本地基准。4 项供应商配置测试、4 项界面配置回归、1 项 Rust 到 Node 管道验证及 7 项本地模拟 API 测试通过；Debug 已构建，真实供应商与窗口操作待实测。
+
+2026-09-29 | 0.7.0 | 模型测试统一为 ModelTrace 三次数字挑战与内置 16 模型基准，移除旧连通性按钮、JSD 流程及手填基准入口；支持当前供应商的 Chat Completions、Responses、Anthropic Messages 传输，沿用同一归因与通过条件。23 项离线验证通过（含取消回收及三协议本地模拟），真实供应商与窗口交互待实测。
