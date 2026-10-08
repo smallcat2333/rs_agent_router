@@ -22,8 +22,11 @@ use tray_icon::{
     MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem},
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow,
+use windows_sys::Win32::UI::{
+    Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
+    WindowsAndMessaging::{
+        IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    },
 };
 
 /// App 决定新任务的执行配置，Harness 只提供工作内容。
@@ -50,7 +53,14 @@ struct Preferences {
     floating_idle_minutes: u64,
     #[serde(default)]
     main_size: Option<[f32; 2]>,
+    /// 悬浮窗固定点：向下延展时为左上角，向上延展时为左下角。
     #[serde(default)]
+    floating_anchor: Option<[f32; 2]>,
+    /// 悬浮窗是否向下延展；由所在显示器位置自动决定并记忆。
+    #[serde(default)]
+    floating_down: bool,
+    /// 旧版只记忆底边；读取后迁移为向上延展的固定点，不再写出。
+    #[serde(default, skip_serializing)]
     floating_bottom: Option<[f32; 2]>,
     #[serde(default)]
     archived: bool,
@@ -70,6 +80,18 @@ fn default_clean_start() -> bool {
 /// 首次启动及旧设置默认最多同时执行三个任务，其余按提交顺序排队。
 fn default_max_parallel() -> usize {
     3
+}
+
+impl Preferences {
+    /// 旧版底边位置等价于向上延展的固定点；已有新字段时忽略旧值。
+    fn migrate_floating(&mut self) {
+        if let Some(bottom) = self.floating_bottom.take()
+            && self.floating_anchor.is_none()
+        {
+            self.floating_anchor = Some(bottom);
+            self.floating_down = false;
+        }
+    }
 }
 
 /// 尚未设置归档时间时保留四小时。
@@ -126,11 +148,31 @@ struct Dashboard {
     _tray: TrayIcon,
 }
 
-/// 底边坐标在拖动和伸缩后记忆；重置中心请求由悬浮视口按实际尺寸消费。
+/// 固定点与延展方向在拖动和伸缩后记忆；重置中心请求由悬浮视口按实际尺寸消费。
+/// expected 为程序最近一次定位后窗口应在的左上角，与实际位置不同即视为用户拖动过；
+/// dragged 记录按住期间发生过的拖动，松开后的首帧据此重排并贴回工作区。
 #[derive(Default)]
 struct FloatingPosition {
-    bottom: Option<[f32; 2]>,
+    anchor: Option<[f32; 2]>,
+    down: bool,
     reset_center: Option<egui::Pos2>,
+    expected: Option<egui::Pos2>,
+    dragged: bool,
+}
+
+/// 设置环境变量 AR_FLOATING_DEBUG 后，把悬浮窗定位判断追加到 %TEMP%\ar_floating_debug.log；默认不写。
+fn floating_debug(line: impl FnOnce() -> String) {
+    use std::io::Write;
+    if std::env::var_os("AR_FLOATING_DEBUG").is_none() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("ar_floating_debug.log"))
+    {
+        let _ = writeln!(file, "{} {}", runner::now_ms(), line());
+    }
 }
 
 /// 恢复窗口无需等待隐藏窗口的绘制事件，避免托盘恢复死锁。
@@ -284,7 +326,7 @@ impl Dashboard {
                 )
             })
             .unwrap_or_else(|| format!("{cli}-未配置"));
-        // Builder 保持初始尺寸不变，后续尺寸调整在子视口中同时维护底边位置。
+        // Builder 保持初始尺寸不变，后续尺寸调整在子视口中按延展方向维护固定边。
         let size = ui::floating_size(0, None);
         let viewport = egui::ViewportId::from_hash_of("floating_monitor");
         ctx.show_viewport_deferred(
@@ -335,30 +377,64 @@ impl Dashboard {
                 };
                 let records = crate::dcr_view::recent(&router_records, &dcr, limit, now,
                     Some((idle_minutes * 60_000) as i64));
-                let size = ui::floating_size(
-                    records.len(),
-                    ctx.input(|input| input.viewport().monitor_size.map(|size| size.y)),
-                );
-                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                // 左键按住时可能正在系统拖动：只实时更新方向和固定点，尺寸与位置待松开后再调整；
+                // 首次显示前不以按住期间的临时位置覆盖记忆。
+                let held = unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } < 0;
+                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect)
+                    && !(held && !ready.load(Ordering::Relaxed))
+                {
                     let mut position = position.lock().unwrap();
-                    let resized = (rect.size() - size).abs().max_elem() > 1.;
-                    let target = if let Some(center) = position.reset_center.take() {
-                        Some(center - size / 2.)
-                    } else if !ready.load(Ordering::Relaxed) && position.bottom.is_some() {
-                        position.bottom.map(|[x, bottom]| egui::pos2(x, bottom - size.y))
-                    } else if resized {
-                        Some(egui::pos2(rect.left(), rect.bottom() - size.y))
+                    // 系统拖动期间可能不重绘，松开后的首帧仍能通过位置差识别这次拖动。
+                    let moved = position.expected.is_none_or(|expected| (rect.min - expected).length() > 2.);
+                    let request = if held {
+                        position.dragged |= moved;
+                        ui::FloatingRequest::Drag
                     } else {
-                        None
+                        let dragged = std::mem::take(&mut position.dragged);
+                        if let Some(center) = position.reset_center.take() {
+                            ui::FloatingRequest::Reset(center)
+                        } else if !ready.load(Ordering::Relaxed) {
+                            match position.anchor {
+                                Some([x, y]) => ui::FloatingRequest::Restore { anchor: egui::pos2(x, y), down: position.down },
+                                None => ui::FloatingRequest::Fresh,
+                            }
+                        } else {
+                            ui::FloatingRequest::Live { moved: moved || dragged }
+                        }
                     };
-                    if let Some(target) = target {
-                        position.bottom = Some([target.x, target.y + size.y]);
-                        ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::OuterPosition(target));
-                    } else {
-                        position.bottom = Some([rect.left(), rect.bottom()]);
+                    // 工作区取窗口将要所在的显示器：恢复/重置按目标位置，其余按窗口中心；拿不到时退回显示器高度且不贴边。
+                    let probe = match request {
+                        ui::FloatingRequest::Restore { anchor, down } => {
+                            anchor + egui::vec2(rect.width() / 2., if down { 20. } else { -20. })
+                        }
+                        ui::FloatingRequest::Reset(center) => center,
+                        _ => rect.center(),
+                    };
+                    let work = ui::OverlayWindow::work_area(probe, ctx.pixels_per_point());
+                    let size = ui::floating_size(
+                        records.len(),
+                        work.map(|work| work.height())
+                            .or_else(|| ctx.input(|input| input.viewport().monitor_size.map(|size| size.y))),
+                    );
+                    let layout = ui::floating_layout(rect, if held { rect.size() } else { size }, work, position.down, request);
+                    if moved || layout.target.is_some() || layout.down != position.down
+                        || !matches!(request, ui::FloatingRequest::Live { .. } | ui::FloatingRequest::Drag)
+                    {
+                        floating_debug(|| format!(
+                            "request={request:?} held={held} outer={rect:?} ppp={} work={work:?} size={size:?} down={}->{} anchor={:?} target={:?}",
+                            ctx.pixels_per_point(), position.down, layout.down, layout.anchor, layout.target,
+                        ));
                     }
-                    if resized {
-                        ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::InnerSize(size));
+                    position.down = layout.down;
+                    position.anchor = Some([layout.anchor.x, layout.anchor.y]);
+                    position.expected = Some(if held { rect.min } else { layout.target.unwrap_or(rect.min) });
+                    if !held {
+                        if let Some(target) = layout.target {
+                            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::OuterPosition(target));
+                        }
+                        if (rect.size() - size).abs().max_elem() > 1. {
+                            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::InnerSize(size));
+                        }
                     }
                 }
                 egui::CentralPanel::default()
@@ -554,7 +630,7 @@ impl eframe::App for Dashboard {
         self.dcr_window(ctx);
         self.quality_window(ctx);
         let now = runner::now_ms() as i64;
-        let old_geometry = (self.preferences.main_size, self.preferences.floating_bottom);
+        let old_geometry = (self.preferences.main_size, self.preferences.floating_anchor, self.preferences.floating_down);
         ctx.input(|input| {
             let viewport = input.viewport();
             if viewport.minimized != Some(true) && viewport.maximized != Some(true)
@@ -564,8 +640,11 @@ impl eframe::App for Dashboard {
                 self.preferences.main_size = Some([rect.width(), rect.height()]);
             }
         });
-        self.preferences.floating_bottom = self.floating_position.lock().unwrap().bottom;
-        if old_geometry != (self.preferences.main_size, self.preferences.floating_bottom) {
+        {
+            let position = self.floating_position.lock().unwrap();
+            (self.preferences.floating_anchor, self.preferences.floating_down) = (position.anchor, position.down);
+        }
+        if old_geometry != (self.preferences.main_size, self.preferences.floating_anchor, self.preferences.floating_down) {
             let root = self.manager.lock().unwrap().root.clone();
             if let Err(error) = std::fs::write(root.join("preferences.json"),
                 serde_json::to_vec_pretty(&self.preferences).unwrap()) {
@@ -1194,7 +1273,7 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
         ),
     };
     let mut legacy_glm = false;
-    let preferences = match std::fs::read(root.join("preferences.json")) {
+    let mut preferences = match std::fs::read(root.join("preferences.json")) {
         Ok(bytes) => {
             let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
             if value["backend"] == "glm" {
@@ -1216,6 +1295,8 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
             floating_limit: default_floating_limit(),
             floating_idle_minutes: default_floating_idle_minutes(),
             main_size: None,
+            floating_anchor: None,
+            floating_down: false,
             floating_bottom: None,
             archived: false,
             agy_proxy_enabled: false,
@@ -1223,6 +1304,7 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
         },
         Err(e) => return Err(e.into()),
     };
+    preferences.migrate_floating();
     if legacy_glm {
         if let Some(profile) = profiles.get("glm").cloned() {
             profiles.insert("claude".into(), profile);
@@ -1361,8 +1443,11 @@ pub fn show(config: PathBuf, root: PathBuf, sid: String) -> Result<i32> {
                 dcr_error: String::new(),
                 main_hwnd: hwnd,
                 floating_position: Arc::new(Mutex::new(FloatingPosition {
-                    bottom: preferences.floating_bottom,
+                    anchor: preferences.floating_anchor,
+                    down: preferences.floating_down,
                     reset_center: None,
+                    expected: None,
+                    dragged: false,
                 })),
                 floating: Arc::new(AtomicBool::new(preferences.floating)),
                 floating_ready: Arc::new(AtomicBool::new(false)),
@@ -1441,6 +1526,7 @@ mod tests {
         assert_eq!(old.retry_timeout_seconds, 60);
         assert_eq!(old.floating_limit, 4);
         assert_eq!(old.floating_idle_minutes, 30);
+        assert_eq!((old.floating_anchor, old.floating_down), (None, false));
         let settings = Preferences {
             dcr: crate::dcr::DcrConfig {
                 auto_start: true,
@@ -1458,7 +1544,9 @@ mod tests {
             floating_limit: 7,
             floating_idle_minutes: 45,
             main_size: Some([1280., 800.]),
-            floating_bottom: Some([100., 900.]),
+            floating_anchor: Some([100., 120.]),
+            floating_down: true,
+            floating_bottom: None,
             archived: true,
             agy_proxy_enabled: false,
             agy_proxy_socks5: String::new(),
@@ -1477,7 +1565,27 @@ mod tests {
         assert_eq!(restored.floating_limit, 7);
         assert_eq!(restored.floating_idle_minutes, 45);
         assert_eq!(restored.main_size, Some([1280., 800.]));
-        assert_eq!(restored.floating_bottom, Some([100., 900.]));
+        assert_eq!(restored.floating_anchor, Some([100., 120.]));
+        assert!(restored.floating_down);
+        assert!(!serde_json::to_value(&settings).unwrap().as_object().unwrap().contains_key("floating_bottom"));
+    }
+    /// 旧版底边位置迁移为向上延展的固定点；新字段已存在时不被旧值覆盖。
+    #[test]
+    fn preferences_migrate_legacy_floating_bottom() {
+        let mut old: Preferences = serde_json::from_value(serde_json::json!({
+            "backend": "claude", "allow_edits": false, "timeout_seconds": 300,
+            "floating_bottom": [100., 900.]
+        }))
+        .unwrap();
+        old.migrate_floating();
+        assert_eq!((old.floating_anchor, old.floating_down, old.floating_bottom), (Some([100., 900.]), false, None));
+        let mut both: Preferences = serde_json::from_value(serde_json::json!({
+            "backend": "claude", "allow_edits": false, "timeout_seconds": 300,
+            "floating_bottom": [100., 900.], "floating_anchor": [300., 80.], "floating_down": true
+        }))
+        .unwrap();
+        both.migrate_floating();
+        assert_eq!((both.floating_anchor, both.floating_down, both.floating_bottom), (Some([300., 80.]), true, None));
     }
     /// 清空终态与归档记录，但不删除执行中的任务或任何日志文件。
     #[test]

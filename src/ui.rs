@@ -153,6 +153,29 @@ impl OverlayWindow {
             }
         }
     }
+    /// 指定逻辑点所在（或最近）显示器的工作区（扣除任务栏），按当前视口缩放换算为逻辑点。
+    /// 按目标位置而非窗口当前位置取屏：启动恢复和重置时窗口尚在默认屏，也能贴到目标屏的工作区。
+    pub fn work_area(point: egui::Pos2, pixels_per_point: f32) -> Option<egui::Rect> {
+        use windows_sys::Win32::{Foundation::POINT, Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint}};
+        unsafe {
+            if pixels_per_point <= 0. || !point.x.is_finite() || !point.y.is_finite() { return None; }
+            let physical = POINT {
+                x: (point.x * pixels_per_point).round() as i32,
+                y: (point.y * pixels_per_point).round() as i32,
+            };
+            let monitor = MonitorFromPoint(physical, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_null() { return None; }
+            let mut info: MONITORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) == 0 { return None; }
+            let work = info.rcWork;
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(work.left as f32, work.top as f32) / pixels_per_point,
+                egui::pos2(work.right as f32, work.bottom as f32) / pixels_per_point,
+            );
+            (rect.width() > 0. && rect.height() > 0.).then_some(rect)
+        }
+    }
     /// 先撤下原生表面并刷新原覆盖区域；随后由 egui 销毁视口，避免关闭末帧留下黑框。
     pub fn hide(&mut self) {
         use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
@@ -1070,6 +1093,99 @@ pub fn floating_size(count: usize, monitor_height: Option<f32>) -> egui::Vec2 {
     )
 }
 
+/// 悬浮窗本帧定位依据：拖动中（只更新方向）、常规帧（moved 表示刚被用户拖动过，需要按方向重排并贴回工作区）、
+/// 启动恢复已记忆固定点、首次无记忆或位置重置到指定中心。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FloatingRequest {
+    Drag,
+    Live { moved: bool },
+    Restore { anchor: egui::Pos2, down: bool },
+    Fresh,
+    Reset(egui::Pos2),
+}
+
+/// 定位结果：延展方向、需记忆的固定点（向下为左上角，向上为左下角）及需要主动移动到的左上角。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloatingLayout {
+    pub down: bool,
+    pub anchor: egui::Pos2,
+    pub target: Option<egui::Pos2>,
+}
+
+/// 固定边按方向取：向下固定顶边，向上固定底边。
+fn floating_anchor(rect: egui::Rect, down: bool) -> egui::Pos2 {
+    if down { rect.left_top() } else { rect.left_bottom() }
+}
+
+/// 由固定点、方向和尺寸还原窗口矩形。
+fn floating_rect(anchor: egui::Pos2, down: bool, size: egui::Vec2) -> egui::Rect {
+    let min = if down { anchor } else { egui::pos2(anchor.x, anchor.y - size.y) };
+    egui::Rect::from_min_size(min, size)
+}
+
+/// 程序定位、伸缩及用户拖动松开后调用；超出工作区的窗口贴回边内，过大时贴顶/贴左。
+fn clamp_into(rect: egui::Rect, work: Option<egui::Rect>) -> egui::Rect {
+    let Some(work) = work else { return rect; };
+    let x = rect.left().min(work.right() - rect.width()).max(work.left());
+    let y = rect.top().min(work.bottom() - rect.height()).max(work.top());
+    egui::Rect::from_min_size(egui::pos2(x, y), rect.size())
+}
+
+/// 窗口中心越过工作区中线并超出余量才翻转：中心在下半区向上延展，在上半区向下延展，中线附近保持原方向。
+/// 只在用户拖动后调用；程序自身伸缩不重新判断，避免增减卡片使中心移动而来回翻转。无工作区信息时保持原方向。
+fn floating_direction(rect: egui::Rect, work: Option<egui::Rect>, down: bool) -> bool {
+    let Some(work) = work else { return down; };
+    let margin = (work.height() * 0.03).max(24.);
+    let middle = work.center().y;
+    let center = rect.center().y;
+    if down { center <= middle + margin } else { center < middle - margin }
+}
+
+/// 首次放置和位置重置直接按窗口中心与工作区中线比较，不使用余量。
+fn floating_center_direction(rect: egui::Rect, work: Option<egui::Rect>, down: bool) -> bool {
+    work.map_or(down, |work| rect.center().y < work.center().y)
+}
+
+/// 根据窗口在所在显示器的位置决定延展方向，并计算尺寸变化后的位置；拖动中及松开后的首帧按新位置更新方向。
+pub fn floating_layout(
+    current: egui::Rect,
+    size: egui::Vec2,
+    work: Option<egui::Rect>,
+    down: bool,
+    request: FloatingRequest,
+) -> FloatingLayout {
+    let shift = |rect: egui::Rect| ((rect.min - current.min).length() > 0.5).then_some(rect.min);
+    match request {
+        FloatingRequest::Reset(center) => {
+            let rect = clamp_into(egui::Rect::from_center_size(center, size), work);
+            let down = floating_center_direction(rect, work, down);
+            FloatingLayout { down, anchor: floating_anchor(rect, down), target: Some(rect.min) }
+        }
+        FloatingRequest::Restore { anchor, down } => {
+            let rect = clamp_into(floating_rect(anchor, down, size), work);
+            let down = floating_direction(rect, work, down);
+            FloatingLayout { down, anchor: floating_anchor(rect, down), target: Some(rect.min) }
+        }
+        FloatingRequest::Fresh => {
+            let down = floating_center_direction(current, work, down);
+            let rect = clamp_into(floating_rect(floating_anchor(current, down), down, size), work);
+            FloatingLayout { down, anchor: floating_anchor(rect, down), target: shift(rect) }
+        }
+        FloatingRequest::Drag => {
+            let down = floating_direction(current, work, down);
+            FloatingLayout { down, anchor: floating_anchor(current, down), target: None }
+        }
+        FloatingRequest::Live { moved } => {
+            let down = if moved { floating_direction(current, work, down) } else { down };
+            if !moved && (current.size() - size).abs().max_elem() <= 1. {
+                return FloatingLayout { down, anchor: floating_anchor(current, down), target: None };
+            }
+            let rect = clamp_into(floating_rect(floating_anchor(current, down), down, size), work);
+            FloatingLayout { down, anchor: floating_anchor(rect, down), target: shift(rect) }
+        }
+    }
+}
+
 /// 图标和标题共用拖动区，与两个按钮独立命中；返回关闭、拖动、清空终态任务的意图。
 pub fn floating_header(ui: &mut egui::Ui, running: usize, model: &str, logo: egui::TextureId) -> (bool, bool, bool) {
     ui.horizontal(|ui| {
@@ -1636,6 +1752,162 @@ mod tests {
         assert_eq!(floating_size(1, None), egui::vec2(400., 140.));
         assert_eq!(floating_size(4, Some(1080.)), egui::vec2(400., 434.));
         assert_eq!(floating_size(20, Some(1080.)), egui::vec2(400., 1000.));
+    }
+    const STILL: FloatingRequest = FloatingRequest::Live { moved: false };
+    const DRAGGED: FloatingRequest = FloatingRequest::Live { moved: true };
+    /// 1080 高工作区（中线 540，余量 32.4）：拖动后中心在下半区向上长、上半区向下长，中间带保持原方向。
+    #[test]
+    fn floating_direction_follows_screen_half_with_hysteresis() {
+        let work = Some(egui::Rect::from_min_size(egui::pos2(0., 0.), egui::vec2(1920., 1080.)));
+        let size = egui::vec2(400., 140.);
+        let at = |y: f32| egui::Rect::from_min_size(egui::pos2(100., y), size);
+        // 中心 830 在下半区：保持向上；中心 370 进入上半区：改向下。
+        assert!(!floating_layout(at(760.), size, work, false, DRAGGED).down);
+        assert!(floating_layout(at(300.), size, work, false, DRAGGED).down);
+        // 中心 520 只略高于中线，未超出余量，不翻转。
+        assert!(!floating_layout(at(450.), size, work, false, DRAGGED).down);
+        // 向下时中心 550 未超出余量仍向下；中心 590 进入下半区改向上。
+        assert!(floating_layout(at(480.), size, work, true, DRAGGED).down);
+        assert!(!floating_layout(at(520.), size, work, true, DRAGGED).down);
+        // 未拖动时不重新判断方向。
+        assert!(!floating_layout(at(300.), size, work, false, STILL).down);
+        // 松开后窗口已在工作区内：只更新方向和固定点，不移动。
+        let live = floating_layout(at(300.), size, work, false, DRAGGED);
+        assert_eq!((live.anchor, live.target), (egui::pos2(100., 300.), None));
+        // 拖动中实时更新方向，但从不主动移动。
+        let drag = floating_layout(at(900.), size, work, true, FloatingRequest::Drag);
+        assert_eq!(drag, FloatingLayout { down: false, anchor: egui::pos2(100., 1040.), target: None });
+        // 无工作区信息时保持原方向。
+        assert!(!floating_layout(at(0.), size, None, false, DRAGGED).down);
+    }
+    /// 回归：1392 高工作区（中线 696，余量 41.76），向下模式的两卡窗口拖到中下部（顶边 650，中心 769），
+    /// 旧规则按顶边判断仍向下；现按中心判断改为向上，随后新卡片使顶边上移、底边不动。
+    #[test]
+    fn floating_dragged_to_lower_middle_grows_upward() {
+        let work = Some(egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(2560., 1392.)));
+        let two = floating_size(2, Some(1392.));
+        let current = egui::Rect::from_min_size(egui::pos2(100., 650.), two);
+        let dragged = floating_layout(current, two, work, true, DRAGGED);
+        assert_eq!(dragged, FloatingLayout { down: false, anchor: egui::pos2(100., 888.), target: None });
+        let three = floating_size(3, Some(1392.));
+        let grown = floating_layout(current, three, work, dragged.down, STILL);
+        assert_eq!(grown, FloatingLayout { down: false, anchor: egui::pos2(100., 888.), target: Some(egui::pos2(100., 552.)) });
+    }
+    /// 回归：主屏工作区 0..1392，窗口被拖到屏幕最下方（顶边 1290，卡片压在任务栏后面）。
+    /// 松开后必须按向上贴回工作区，之后新卡片向上长；启动恢复越界的旧固定点同样贴回。
+    #[test]
+    fn floating_dropped_over_taskbar_is_pulled_back_and_grows_up() {
+        let work = Some(egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(2560., 1392.)));
+        let two = floating_size(2, Some(1392.));
+        let dropped = egui::Rect::from_min_size(egui::pos2(2085., 1290.), two);
+        // 拖动中只翻方向，不移动窗口。
+        let drag = floating_layout(dropped, two, work, true, FloatingRequest::Drag);
+        assert_eq!(drag, FloatingLayout { down: false, anchor: egui::pos2(2085., 1528.), target: None });
+        // 松开后贴回：底边落在工作区底部。
+        let released = floating_layout(dropped, two, work, drag.down, DRAGGED);
+        assert_eq!(released, FloatingLayout { down: false, anchor: egui::pos2(2085., 1392.), target: Some(egui::pos2(2085., 1154.)) });
+        let placed = egui::Rect::from_min_size(egui::pos2(2085., 1154.), two);
+        let three = floating_size(3, Some(1392.));
+        let grown = floating_layout(placed, three, work, released.down, STILL);
+        assert_eq!(grown, FloatingLayout { down: false, anchor: egui::pos2(2085., 1392.), target: Some(egui::pos2(2085., 1056.)) });
+        // 启动时记忆的固定点 (2085, 1701) 已在屏幕外，四张卡片恢复后底边贴在工作区底部。
+        let four = floating_size(4, Some(1392.));
+        let startup = egui::Rect::from_min_size(egui::pos2(0., 0.), egui::vec2(400., 86.));
+        let restored = floating_layout(startup, four, work, false,
+            FloatingRequest::Restore { anchor: egui::pos2(2085., 1701.), down: false });
+        assert_eq!(restored, FloatingLayout { down: false, anchor: egui::pos2(2085., 1392.), target: Some(egui::pos2(2085., 958.)) });
+    }
+    /// 左侧副屏工作区为负坐标（-1680..0 × 0..1002）时同样按该屏中线判断并贴边。
+    #[test]
+    fn floating_handles_negative_monitor_coordinates() {
+        let work = Some(egui::Rect::from_min_max(egui::pos2(-1680., 0.), egui::pos2(0., 1002.)));
+        let small = egui::vec2(400., 140.);
+        let current = egui::Rect::from_min_size(egui::pos2(-1000., 700.), small);
+        let dragged = floating_layout(current, small, work, true, DRAGGED);
+        assert_eq!(dragged, FloatingLayout { down: false, anchor: egui::pos2(-1000., 840.), target: None });
+        let grown = floating_layout(current, floating_size(4, Some(1002.)), work, false, STILL);
+        assert_eq!(grown.target, Some(egui::pos2(-1000., 406.)));
+        let top = egui::Rect::from_min_size(egui::pos2(-1700., 50.), small);
+        let dragged = floating_layout(top, small, work, false, DRAGGED);
+        assert_eq!(dragged, FloatingLayout { down: true, anchor: egui::pos2(-1680., 50.), target: Some(egui::pos2(-1680., 50.)) });
+        let grown = floating_layout(top, floating_size(4, Some(1002.)), work, true, STILL);
+        assert_eq!(grown.target, Some(egui::pos2(-1680., 50.)));
+    }
+    /// 增减卡片只改尺寸：向下固定顶边只缩放，向上固定底边并移动顶边；中心越过中线也不翻转。
+    #[test]
+    fn floating_growth_keeps_anchor_without_flipping() {
+        let work = Some(egui::Rect::from_min_size(egui::pos2(0., 0.), egui::vec2(1920., 1080.)));
+        let small = egui::vec2(400., 140.);
+        let big = floating_size(4, Some(1080.));
+        let tall = egui::vec2(400., 700.);
+        // 向下：顶边 100 固定，长高后无需移动。
+        let current = egui::Rect::from_min_size(egui::pos2(100., 100.), small);
+        let grown = floating_layout(current, big, work, true, STILL);
+        assert_eq!(grown, FloatingLayout { down: true, anchor: egui::pos2(100., 100.), target: None });
+        // 向上：底边 1000 固定，长高时顶边上移。
+        let current = egui::Rect::from_min_size(egui::pos2(100., 860.), small);
+        let grown = floating_layout(current, big, work, false, STILL);
+        assert_eq!(grown, FloatingLayout { down: false, anchor: egui::pos2(100., 1000.), target: Some(egui::pos2(100., 566.)) });
+        // 再收缩回去仍以底边为准。
+        let after = egui::Rect::from_min_size(egui::pos2(100., 566.), big);
+        let shrunk = floating_layout(after, small, work, false, STILL);
+        assert_eq!(shrunk, FloatingLayout { down: false, anchor: egui::pos2(100., 1000.), target: Some(egui::pos2(100., 860.)) });
+        // 向上长到中心 450 已在上半区，未拖动仍向上。
+        let current = egui::Rect::from_min_size(egui::pos2(100., 660.), small);
+        let grown = floating_layout(current, tall, work, false, STILL);
+        assert_eq!(grown.target, Some(egui::pos2(100., 100.)));
+        let after = egui::Rect::from_min_size(egui::pos2(100., 100.), tall);
+        assert!(!floating_layout(after, tall, work, false, STILL).down);
+        // 向下长到中心 617 已在下半区，未拖动仍向下。
+        let current = egui::Rect::from_min_size(egui::pos2(100., 400.), small);
+        let grown = floating_layout(current, big, work, true, STILL);
+        assert!(grown.down && grown.target.is_none());
+    }
+    /// 程序主动移动时贴回工作区：向下长出底边则上移，向上长出顶边则下移，横向超出则左移。
+    #[test]
+    fn floating_moves_are_clamped_into_work_area() {
+        let work = Some(egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1920., 1040.)));
+        let small = egui::vec2(400., 140.);
+        let big = egui::vec2(400., 434.);
+        let tall = egui::vec2(400., 700.);
+        let current = egui::Rect::from_min_size(egui::pos2(100., 450.), small);
+        let grown = floating_layout(current, tall, work, true, STILL);
+        assert_eq!(grown, FloatingLayout { down: true, anchor: egui::pos2(100., 340.), target: Some(egui::pos2(100., 340.)) });
+        let current = egui::Rect::from_min_size(egui::pos2(1700., 600.), small);
+        let grown = floating_layout(current, big, work, false, STILL);
+        assert_eq!(grown.target, Some(egui::pos2(1520., 306.)));
+        let current = egui::Rect::from_min_size(egui::pos2(100., 460.), small);
+        let grown = floating_layout(current, tall, work, false, STILL);
+        assert_eq!(grown, FloatingLayout { down: false, anchor: egui::pos2(100., 700.), target: Some(egui::pos2(100., 0.)) });
+        // 未拖动且尺寸不变时不移动；拖出工作区松开后按方向贴回。
+        let outside = egui::Rect::from_min_size(egui::pos2(-200., 1000.), small);
+        assert_eq!(floating_layout(outside, small, work, false, STILL).target, None);
+        assert_eq!(floating_layout(outside, small, work, false, DRAGGED),
+            FloatingLayout { down: false, anchor: egui::pos2(0., 1040.), target: Some(egui::pos2(0., 900.)) });
+    }
+    /// 重置和首次放置按中心与中线比较；启动恢复使用记忆方向与固定点，并贴回当前工作区。
+    #[test]
+    fn floating_reset_restore_and_fresh_rules() {
+        let work = Some(egui::Rect::from_min_size(egui::pos2(0., 0.), egui::vec2(1920., 1080.)));
+        let size = egui::vec2(400., 140.);
+        let current = egui::Rect::from_min_size(egui::pos2(0., 0.), egui::vec2(400., 86.));
+        let reset = floating_layout(current, size, work, false, FloatingRequest::Reset(egui::pos2(960., 530.)));
+        assert_eq!(reset, FloatingLayout { down: true, anchor: egui::pos2(760., 460.), target: Some(egui::pos2(760., 460.)) });
+        let reset = floating_layout(current, size, work, true, FloatingRequest::Reset(egui::pos2(960., 550.)));
+        assert_eq!(reset, FloatingLayout { down: false, anchor: egui::pos2(760., 620.), target: Some(egui::pos2(760., 480.)) });
+        let restore = floating_layout(current, size, work, false,
+            FloatingRequest::Restore { anchor: egui::pos2(100., 900.), down: false });
+        assert_eq!(restore, FloatingLayout { down: false, anchor: egui::pos2(100., 900.), target: Some(egui::pos2(100., 760.)) });
+        let restore = floating_layout(current, size, work, false,
+            FloatingRequest::Restore { anchor: egui::pos2(100., 100.), down: true });
+        assert_eq!(restore, FloatingLayout { down: true, anchor: egui::pos2(100., 100.), target: Some(egui::pos2(100., 100.)) });
+        // 旧显示器位置已不存在时贴回当前工作区，并按贴回后的位置改向上。
+        let restore = floating_layout(current, size, work, true,
+            FloatingRequest::Restore { anchor: egui::pos2(3000., 2000.), down: true });
+        assert_eq!(restore, FloatingLayout { down: false, anchor: egui::pos2(1520., 1080.), target: Some(egui::pos2(1520., 940.)) });
+        let fresh = floating_layout(egui::Rect::from_min_size(egui::pos2(200., 100.), egui::vec2(400., 86.)),
+            size, work, false, FloatingRequest::Fresh);
+        assert_eq!(fresh, FloatingLayout { down: true, anchor: egui::pos2(200., 100.), target: None });
     }
     /// 耗时和活动时间使用同一紧凑单位，边界不会显示负数或错进位。
     #[test]
